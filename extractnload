@@ -1,0 +1,325 @@
+"""
+Enterprise CSV to Oracle Database Bulk Loader
+Single file script with multithreading and connection pooling
+"""
+
+import oracledb
+import pandas as pd
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import time
+from contextlib import contextmanager
+
+
+# ==================== CONFIGURATION ====================
+# Database Configuration
+DB_USER = 'your_username'
+DB_PASSWORD = 'your_password'
+DB_DSN = 'localhost:1521/XEPDB1'  # host:port/service_name
+
+# Loading Configuration
+STAGING_TABLE = 'STG_DATA_LOAD'
+CSV_FILE = 'data.csv'
+CHUNK_SIZE = 10000          # Rows per chunk
+MAX_WORKERS = 4             # Parallel threads
+MIN_CONNECTIONS = 2         # Min pool connections
+MAX_CONNECTIONS = 10        # Max pool connections
+
+# Options
+CREATE_TABLE = True         # Auto-create table from CSV schema
+DROP_IF_EXISTS = True       # Drop existing table
+BATCH_ERRORS = False        # Continue on row errors
+CSV_ENCODING = 'utf-8'      # CSV file encoding
+
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(threadName)-10s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# ==================== GLOBAL VARIABLES ====================
+connection_pool = None
+stats_lock = Lock()
+total_rows_loaded = 0
+total_rows_failed = 0
+
+
+# ==================== CONNECTION POOL ====================
+def create_connection_pool():
+    """Create Oracle connection pool"""
+    global connection_pool
+    try:
+        connection_pool = oracledb.create_pool(
+            user=DB_USER,
+            password=DB_PASSWORD,
+            dsn=DB_DSN,
+            min=MIN_CONNECTIONS,
+            max=MAX_CONNECTIONS,
+            increment=1,
+            threaded=True,
+            getmode=oracledb.POOL_GETMODE_WAIT
+        )
+        logger.info(f"Connection pool created: min={MIN_CONNECTIONS}, max={MAX_CONNECTIONS}")
+    except Exception as e:
+        logger.error(f"Failed to create connection pool: {e}")
+        raise
+
+
+def close_connection_pool():
+    """Close Oracle connection pool"""
+    global connection_pool
+    if connection_pool:
+        connection_pool.close()
+        logger.info("Connection pool closed")
+
+
+@contextmanager
+def get_connection():
+    """Context manager for database connections"""
+    conn = connection_pool.acquire()
+    try:
+        yield conn
+    finally:
+        connection_pool.release(conn)
+
+
+# ==================== TABLE MANAGEMENT ====================
+def create_staging_table(sample_df):
+    """Create staging table based on DataFrame schema"""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Drop existing table if required
+            if DROP_IF_EXISTS:
+                try:
+                    cursor.execute(f"DROP TABLE {STAGING_TABLE} PURGE")
+                    logger.info(f"Dropped existing table {STAGING_TABLE}")
+                except oracledb.DatabaseError:
+                    pass  # Table doesn't exist
+            
+            # Map pandas dtypes to Oracle types
+            type_mapping = {
+                'int64': 'NUMBER',
+                'int32': 'NUMBER',
+                'float64': 'NUMBER',
+                'float32': 'NUMBER',
+                'object': 'VARCHAR2(4000)',
+                'bool': 'NUMBER(1)',
+                'datetime64[ns]': 'TIMESTAMP',
+                'datetime64': 'TIMESTAMP'
+            }
+            
+            # Build column definitions
+            columns_def = []
+            for col, dtype in sample_df.dtypes.items():
+                clean_col = col.replace(' ', '_').replace('-', '_')
+                oracle_type = type_mapping.get(str(dtype), 'VARCHAR2(4000)')
+                columns_def.append(f"{clean_col} {oracle_type}")
+            
+            # Create table
+            create_sql = f"CREATE TABLE {STAGING_TABLE} ({', '.join(columns_def)})"
+            cursor.execute(create_sql)
+            conn.commit()
+            
+            logger.info(f"Staging table {STAGING_TABLE} created successfully")
+            cursor.close()
+            
+    except Exception as e:
+        logger.error(f"Failed to create staging table: {e}")
+        raise
+
+
+def truncate_table():
+    """Truncate the staging table"""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"TRUNCATE TABLE {STAGING_TABLE}")
+            conn.commit()
+            logger.info(f"Table {STAGING_TABLE} truncated")
+            cursor.close()
+    except Exception as e:
+        logger.error(f"Failed to truncate table: {e}")
+        raise
+
+
+# ==================== DATA LOADING ====================
+def prepare_insert_statement(columns):
+    """Generate parameterized INSERT statement"""
+    cols = ', '.join(columns)
+    placeholders = ', '.join([f':{i+1}' for i in range(len(columns))])
+    return f"INSERT INTO {STAGING_TABLE} ({cols}) VALUES ({placeholders})"
+
+
+def load_chunk(chunk_data, chunk_id):
+    """Load a single chunk into Oracle database"""
+    global total_rows_loaded, total_rows_failed
+    start_time = time.time()
+    rows_inserted = 0
+    
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Enable array DML for better performance
+            cursor.setinputsizes(None, CHUNK_SIZE)
+            
+            # Prepare data
+            columns = chunk_data.columns.tolist()
+            insert_sql = prepare_insert_statement(columns)
+            
+            # Handle NaN/None values
+            chunk_data = chunk_data.where(pd.notnull(chunk_data), None)
+            
+            # Convert to list of tuples
+            data_tuples = [tuple(row) for row in chunk_data.values]
+            
+            # Batch insert
+            if BATCH_ERRORS:
+                cursor.executemany(insert_sql, data_tuples, batcherrors=True)
+                
+                # Check for batch errors
+                errors = cursor.getbatcherrors()
+                if errors:
+                    logger.warning(f"Chunk {chunk_id}: {len(errors)} row errors")
+                    rows_inserted = len(data_tuples) - len(errors)
+                else:
+                    rows_inserted = len(data_tuples)
+            else:
+                cursor.executemany(insert_sql, data_tuples)
+                rows_inserted = len(data_tuples)
+            
+            conn.commit()
+            cursor.close()
+            
+        elapsed = time.time() - start_time
+        throughput = rows_inserted / elapsed if elapsed > 0 else 0
+        
+        logger.info(
+            f"Chunk {chunk_id}: Inserted {rows_inserted:,} rows in {elapsed:.2f}s "
+            f"({throughput:,.0f} rows/sec)"
+        )
+        
+        # Update global stats
+        with stats_lock:
+            total_rows_loaded += rows_inserted
+        
+        return {
+            'chunk_id': chunk_id,
+            'rows_inserted': rows_inserted,
+            'success': True,
+            'elapsed': elapsed
+        }
+        
+    except Exception as e:
+        logger.error(f"Chunk {chunk_id} failed: {e}")
+        with stats_lock:
+            total_rows_failed += len(chunk_data)
+        return {
+            'chunk_id': chunk_id,
+            'rows_inserted': 0,
+            'success': False,
+            'error': str(e)
+        }
+
+
+def load_csv_file():
+    """Main function to load CSV file into Oracle"""
+    global total_rows_loaded, total_rows_failed
+    
+    logger.info(f"Starting CSV load: {CSV_FILE}")
+    logger.info(f"Target table: {STAGING_TABLE}")
+    logger.info(f"Chunk size: {CHUNK_SIZE:,} rows")
+    logger.info(f"Max workers: {MAX_WORKERS}")
+    
+    overall_start = time.time()
+    
+    # Reset counters
+    total_rows_loaded = 0
+    total_rows_failed = 0
+    
+    try:
+        # Read first chunk to get schema
+        df_iterator = pd.read_csv(
+            CSV_FILE, 
+            chunksize=CHUNK_SIZE, 
+            low_memory=False,
+            encoding=CSV_ENCODING
+        )
+        first_chunk = next(df_iterator)
+        
+        # Create table if needed
+        if CREATE_TABLE:
+            create_staging_table(first_chunk)
+        
+        # Process chunks in parallel
+        chunk_id = 0
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit first chunk
+            futures.append(executor.submit(load_chunk, first_chunk, chunk_id))
+            chunk_id += 1
+            
+            # Submit remaining chunks
+            for chunk in df_iterator:
+                futures.append(executor.submit(load_chunk, chunk, chunk_id))
+                chunk_id += 1
+            
+            # Wait for all chunks to complete
+            results = []
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+        
+        # Calculate statistics
+        overall_elapsed = time.time() - overall_start
+        overall_throughput = total_rows_loaded / overall_elapsed if overall_elapsed > 0 else 0
+        
+        # Print results
+        print("\n" + "="*70)
+        print("LOAD STATISTICS".center(70))
+        print("="*70)
+        print(f"CSV File:           {CSV_FILE}")
+        print(f"Target Table:       {STAGING_TABLE}")
+        print(f"Total Rows Loaded:  {total_rows_loaded:,}")
+        print(f"Total Rows Failed:  {total_rows_failed:,}")
+        print(f"Total Chunks:       {chunk_id}")
+        print(f"Chunk Size:         {CHUNK_SIZE:,} rows")
+        print(f"Parallel Workers:   {MAX_WORKERS}")
+        print(f"Elapsed Time:       {overall_elapsed:.2f} seconds")
+        print(f"Throughput:         {overall_throughput:,.0f} rows/second")
+        print(f"Status:             {'SUCCESS' if total_rows_failed == 0 else 'COMPLETED WITH ERRORS'}")
+        print("="*70)
+        
+        logger.info("Load completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Load failed: {e}")
+        raise
+
+
+# ==================== MAIN EXECUTION ====================
+def main():
+    """Main execution function"""
+    try:
+        # Create connection pool
+        create_connection_pool()
+        
+        # Load CSV file
+        load_csv_file()
+        
+    except Exception as e:
+        logger.error(f"Script execution failed: {e}")
+        raise
+    finally:
+        # Clean up
+        close_connection_pool()
+
+
+if __name__ == "__main__":
+    main()
