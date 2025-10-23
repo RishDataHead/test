@@ -1,0 +1,476 @@
+"""
+Enterprise CSV to Oracle Database Bulk Loader using SQL*Loader
+Single file script with multithreading and SQL*Loader for maximum performance
+"""
+
+import oracledb
+import pandas as pd
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import time
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+# ==================== CONFIGURATION ====================
+# Database Configuration
+DB_USER = 'your_username'
+DB_PASSWORD = 'your_password'
+DB_DSN = 'localhost:1521/XEPDB1'  # host:port/service_name
+
+# Loading Configuration
+STAGING_TABLE = 'STG_DATA_LOAD'
+CSV_FILE = 'data.csv'
+CHUNK_SIZE = 10000          # Rows per chunk
+MAX_WORKERS = 4             # Parallel threads
+MIN_CONNECTIONS = 2         # Min pool connections
+MAX_CONNECTIONS = 10        # Max pool connections
+
+# SQL*Loader Configuration
+SQLLDR_PATH = 'sqlldr'      # Path to sqlldr executable (adjust if needed)
+DIRECT_PATH = True          # Use direct path load (faster, but has restrictions)
+ROWS_PER_COMMIT = 10000     # Rows per commit (for conventional path)
+PARALLEL_LOAD = True        # Enable parallel SQL*Loader processes
+
+# Options
+CREATE_TABLE = True         # Auto-create table from CSV schema
+DROP_IF_EXISTS = True       # Drop existing table
+CSV_ENCODING = 'utf-8'      # CSV file encoding
+KEEP_TEMP_FILES = False     # Keep temporary files for debugging
+
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(threadName)-10s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# ==================== GLOBAL VARIABLES ====================
+connection_pool = None
+stats_lock = Lock()
+total_rows_loaded = 0
+total_rows_failed = 0
+temp_dir = None
+
+
+# ==================== CONNECTION POOL ====================
+def create_connection_pool():
+    """Create Oracle connection pool"""
+    global connection_pool
+    try:
+        connection_pool = oracledb.create_pool(
+            user=DB_USER,
+            password=DB_PASSWORD,
+            dsn=DB_DSN,
+            min=MIN_CONNECTIONS,
+            max=MAX_CONNECTIONS,
+            increment=1,
+            threaded=True,
+            getmode=oracledb.POOL_GETMODE_WAIT
+        )
+        logger.info(f"Connection pool created: min={MIN_CONNECTIONS}, max={MAX_CONNECTIONS}")
+    except Exception as e:
+        logger.error(f"Failed to create connection pool: {e}")
+        raise
+
+
+def close_connection_pool():
+    """Close Oracle connection pool"""
+    global connection_pool
+    if connection_pool:
+        connection_pool.close()
+        logger.info("Connection pool closed")
+
+
+def get_connection():
+    """Get a connection from the pool"""
+    return connection_pool.acquire()
+
+
+def release_connection(conn):
+    """Release a connection back to the pool"""
+    connection_pool.release(conn)
+
+
+# ==================== TABLE MANAGEMENT ====================
+def create_staging_table(sample_df):
+    """Create staging table based on DataFrame schema"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # Drop existing table if required
+        if DROP_IF_EXISTS:
+            try:
+                cursor.execute(f"DROP TABLE {STAGING_TABLE} PURGE")
+                logger.info(f"Dropped existing table {STAGING_TABLE}")
+            except oracledb.DatabaseError:
+                pass  # Table doesn't exist
+        
+        # Map pandas dtypes to Oracle types
+        type_mapping = {
+            'int64': 'NUMBER',
+            'int32': 'NUMBER',
+            'float64': 'NUMBER',
+            'float32': 'NUMBER',
+            'object': 'VARCHAR2(4000)',
+            'bool': 'NUMBER(1)',
+            'datetime64[ns]': 'TIMESTAMP',
+            'datetime64': 'TIMESTAMP'
+        }
+        
+        # Build column definitions
+        columns_def = []
+        for col, dtype in sample_df.dtypes.items():
+            clean_col = col.replace(' ', '_').replace('-', '_').upper()
+            oracle_type = type_mapping.get(str(dtype), 'VARCHAR2(4000)')
+            columns_def.append(f"{clean_col} {oracle_type}")
+        
+        # Create table
+        create_sql = f"CREATE TABLE {STAGING_TABLE} ({', '.join(columns_def)})"
+        cursor.execute(create_sql)
+        conn.commit()
+        
+        logger.info(f"Staging table {STAGING_TABLE} created successfully")
+        cursor.close()
+        release_connection(conn)
+        
+    except Exception as e:
+        logger.error(f"Failed to create staging table: {e}")
+        raise
+
+
+def get_row_count():
+    """Get current row count from staging table"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {STAGING_TABLE}")
+        count = cursor.fetchone()[0]
+        cursor.close()
+        release_connection(conn)
+        return count
+    except Exception as e:
+        logger.error(f"Failed to get row count: {e}")
+        return 0
+
+
+# ==================== SQL*LOADER FUNCTIONS ====================
+def create_control_file(columns, data_file_path, chunk_id):
+    """Create SQL*Loader control file"""
+    control_file = os.path.join(temp_dir, f'chunk_{chunk_id}.ctl')
+    
+    # Clean column names
+    clean_columns = [col.replace(' ', '_').replace('-', '_').upper() for col in columns]
+    
+    # Build column specification
+    col_specs = []
+    for i, col in enumerate(clean_columns, 1):
+        col_specs.append(f'    {col} CHAR TERMINATED BY ","')
+    
+    # Handle last column differently (terminated by newline)
+    if col_specs:
+        col_specs[-1] = f'    {clean_columns[-1]} CHAR TERMINATED BY WHITESPACE'
+    
+    # Create control file content
+    control_content = f"""
+LOAD DATA
+INFILE '{data_file_path}'
+{"APPEND" if not DROP_IF_EXISTS and chunk_id > 0 else "APPEND"}
+INTO TABLE {STAGING_TABLE}
+FIELDS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '"'
+TRAILING NULLCOLS
+(
+{chr(10).join(col_specs)}
+)
+"""
+    
+    with open(control_file, 'w') as f:
+        f.write(control_content)
+    
+    return control_file
+
+
+def run_sqlldr(control_file, chunk_id, data_file_path):
+    """Execute SQL*Loader command"""
+    log_file = os.path.join(temp_dir, f'chunk_{chunk_id}.log')
+    bad_file = os.path.join(temp_dir, f'chunk_{chunk_id}.bad')
+    discard_file = os.path.join(temp_dir, f'chunk_{chunk_id}.dsc')
+    
+    # Build SQL*Loader command
+    cmd = [
+        SQLLDR_PATH,
+        f'{DB_USER}/{DB_PASSWORD}@{DB_DSN}',
+        f'control={control_file}',
+        f'log={log_file}',
+        f'bad={bad_file}',
+        f'discard={discard_file}',
+        'errors=1000000',
+        'skip=1'  # Skip header row
+    ]
+    
+    if DIRECT_PATH:
+        cmd.append('direct=true')
+        if PARALLEL_LOAD:
+            cmd.append('parallel=true')
+    else:
+        cmd.append(f'rows={ROWS_PER_COMMIT}')
+    
+    return cmd, log_file, bad_file
+
+
+def parse_sqlldr_log(log_file):
+    """Parse SQL*Loader log file to extract statistics"""
+    stats = {
+        'rows_loaded': 0,
+        'rows_rejected': 0,
+        'rows_discarded': 0,
+        'elapsed_time': 0
+    }
+    
+    try:
+        if not os.path.exists(log_file):
+            return stats
+            
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+            
+        # Extract statistics using string parsing
+        for line in log_content.split('\n'):
+            line = line.strip()
+            if 'Rows successfully loaded' in line or 'Total logical records read' in line:
+                try:
+                    stats['rows_loaded'] = int(line.split(':')[1].strip().split()[0])
+                except:
+                    pass
+            elif 'Rows not loaded due to data errors' in line or 'Total logical records rejected' in line:
+                try:
+                    stats['rows_rejected'] = int(line.split(':')[1].strip().split()[0])
+                except:
+                    pass
+            elif 'Rows not loaded because all WHEN clauses were failed' in line:
+                try:
+                    stats['rows_discarded'] = int(line.split(':')[1].strip().split()[0])
+                except:
+                    pass
+            elif 'Elapsed time was:' in line or 'Run began on' in line:
+                # Could parse time, but we're tracking it separately
+                pass
+                
+    except Exception as e:
+        logger.warning(f"Failed to parse SQL*Loader log: {e}")
+    
+    return stats
+
+
+def load_chunk_with_sqlldr(chunk_data, chunk_id):
+    """Load a single chunk using SQL*Loader"""
+    global total_rows_loaded, total_rows_failed
+    start_time = time.time()
+    
+    try:
+        # Write chunk to temporary CSV file
+        data_file = os.path.join(temp_dir, f'chunk_{chunk_id}.csv')
+        chunk_data.to_csv(data_file, index=False, header=True)
+        
+        # Create control file
+        columns = chunk_data.columns.tolist()
+        control_file = create_control_file(columns, data_file, chunk_id)
+        
+        # Run SQL*Loader
+        cmd, log_file, bad_file = run_sqlldr(control_file, chunk_id, data_file)
+        
+        logger.info(f"Chunk {chunk_id}: Starting SQL*Loader...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        elapsed = time.time() - start_time
+        
+        # Parse log file for statistics
+        stats = parse_sqlldr_log(log_file)
+        rows_loaded = stats['rows_loaded']
+        rows_rejected = stats['rows_rejected']
+        
+        throughput = rows_loaded / elapsed if elapsed > 0 else 0
+        
+        if result.returncode == 0 or result.returncode == 2:  # 0=success, 2=warnings
+            logger.info(
+                f"Chunk {chunk_id}: Loaded {rows_loaded:,} rows, "
+                f"Rejected {rows_rejected:,} rows in {elapsed:.2f}s "
+                f"({throughput:,.0f} rows/sec)"
+            )
+            
+            # Update global stats
+            with stats_lock:
+                total_rows_loaded += rows_loaded
+                total_rows_failed += rows_rejected
+            
+            # Clean up temporary files
+            if not KEEP_TEMP_FILES:
+                for f in [data_file, control_file, log_file]:
+                    if os.path.exists(f):
+                        os.remove(f)
+                if os.path.exists(bad_file) and os.path.getsize(bad_file) == 0:
+                    os.remove(bad_file)
+            
+            return {
+                'chunk_id': chunk_id,
+                'rows_loaded': rows_loaded,
+                'rows_rejected': rows_rejected,
+                'success': True,
+                'elapsed': elapsed
+            }
+        else:
+            logger.error(f"Chunk {chunk_id}: SQL*Loader failed with return code {result.returncode}")
+            logger.error(f"Error output: {result.stderr}")
+            
+            with stats_lock:
+                total_rows_failed += len(chunk_data)
+            
+            return {
+                'chunk_id': chunk_id,
+                'rows_loaded': 0,
+                'rows_rejected': len(chunk_data),
+                'success': False,
+                'error': result.stderr
+            }
+            
+    except Exception as e:
+        logger.error(f"Chunk {chunk_id} failed: {e}")
+        with stats_lock:
+            total_rows_failed += len(chunk_data)
+        return {
+            'chunk_id': chunk_id,
+            'rows_loaded': 0,
+            'rows_rejected': len(chunk_data),
+            'success': False,
+            'error': str(e)
+        }
+
+
+# ==================== MAIN LOADING FUNCTION ====================
+def load_csv_file():
+    """Main function to load CSV file into Oracle using SQL*Loader"""
+    global total_rows_loaded, total_rows_failed, temp_dir
+    
+    logger.info(f"Starting CSV load using SQL*Loader: {CSV_FILE}")
+    logger.info(f"Target table: {STAGING_TABLE}")
+    logger.info(f"Chunk size: {CHUNK_SIZE:,} rows")
+    logger.info(f"Max workers: {MAX_WORKERS}")
+    logger.info(f"Direct path: {DIRECT_PATH}")
+    logger.info(f"Parallel load: {PARALLEL_LOAD}")
+    
+    overall_start = time.time()
+    
+    # Reset counters
+    total_rows_loaded = 0
+    total_rows_failed = 0
+    
+    # Create temporary directory for SQL*Loader files
+    temp_dir = tempfile.mkdtemp(prefix='sqlldr_')
+    logger.info(f"Temporary directory: {temp_dir}")
+    
+    try:
+        # Read first chunk to get schema
+        df_iterator = pd.read_csv(
+            CSV_FILE, 
+            chunksize=CHUNK_SIZE, 
+            low_memory=False,
+            encoding=CSV_ENCODING
+        )
+        first_chunk = next(df_iterator)
+        
+        # Create table if needed
+        if CREATE_TABLE:
+            create_staging_table(first_chunk)
+        
+        # Get initial row count
+        initial_count = get_row_count() if not DROP_IF_EXISTS else 0
+        
+        # Process chunks in parallel using SQL*Loader
+        chunk_id = 0
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit first chunk
+            futures.append(executor.submit(load_chunk_with_sqlldr, first_chunk, chunk_id))
+            chunk_id += 1
+            
+            # Submit remaining chunks
+            for chunk in df_iterator:
+                futures.append(executor.submit(load_chunk_with_sqlldr, chunk, chunk_id))
+                chunk_id += 1
+            
+            # Wait for all chunks to complete
+            results = []
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+        
+        # Get final row count
+        final_count = get_row_count()
+        actual_rows_loaded = final_count - initial_count
+        
+        # Calculate statistics
+        overall_elapsed = time.time() - overall_start
+        overall_throughput = actual_rows_loaded / overall_elapsed if overall_elapsed > 0 else 0
+        
+        # Print results
+        print("\n" + "="*70)
+        print("SQL*LOADER STATISTICS".center(70))
+        print("="*70)
+        print(f"CSV File:           {CSV_FILE}")
+        print(f"Target Table:       {STAGING_TABLE}")
+        print(f"Load Method:        SQL*Loader ({'Direct Path' if DIRECT_PATH else 'Conventional Path'})")
+        print(f"Parallel Load:      {PARALLEL_LOAD}")
+        print(f"Total Rows Loaded:  {actual_rows_loaded:,}")
+        print(f"Total Rows Failed:  {total_rows_failed:,}")
+        print(f"Total Chunks:       {chunk_id}")
+        print(f"Chunk Size:         {CHUNK_SIZE:,} rows")
+        print(f"Parallel Workers:   {MAX_WORKERS}")
+        print(f"Elapsed Time:       {overall_elapsed:.2f} seconds")
+        print(f"Throughput:         {overall_throughput:,.0f} rows/second")
+        print(f"Temp Directory:     {temp_dir}")
+        print(f"Status:             {'SUCCESS' if total_rows_failed == 0 else 'COMPLETED WITH ERRORS'}")
+        print("="*70)
+        
+        logger.info("Load completed successfully")
+        
+        # Clean up temporary directory
+        if not KEEP_TEMP_FILES:
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+                logger.info("Temporary files cleaned up")
+            except:
+                logger.warning(f"Failed to clean up temporary directory: {temp_dir}")
+        
+    except Exception as e:
+        logger.error(f"Load failed: {e}")
+        raise
+
+
+# ==================== MAIN EXECUTION ====================
+def main():
+    """Main execution function"""
+    try:
+        # Create connection pool
+        create_connection_pool()
+        
+        # Load CSV file using SQL*Loader
+        load_csv_file()
+        
+    except Exception as e:
+        logger.error(f"Script execution failed: {e}")
+        raise
+    finally:
+        # Clean up
+        close_connection_pool()
+
+
+if __name__ == "__main__":
+    main()
