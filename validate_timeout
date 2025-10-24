@@ -1,0 +1,90 @@
+def _validate_with_timeout(self, schema, xml_doc, timeout: int) -> tuple:
+        """
+        Validate XML with timeout using ThreadPoolExecutor
+        Returns (success, error_message)
+        """
+        def validate():
+            try:
+                is_valid = schema.validate(xml_doc)
+                if is_valid:
+                    return True, None
+                else:
+                    errors = []
+                    for i, error in enumerate(schema.error_log, 1):
+                        errors.append(f"Line {error.line}, Col {error.column}: {error.message}")
+                        if i >= 10:  # Limit errors
+                            errors.append(f"... and {len(schema.error_log) - 10} more errors")
+                            break
+                    return False, "\n  ".join(errors)
+            except Exception as e:
+                return False, str(e)
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(validate)
+            try:
+                result = future.result(timeout=timeout)
+                return result
+            except TimeoutError:
+                return False, f"Validation timed out after {timeout} seconds (possibly incompatible schema)"
+            except Exception as e:
+                return False, f"Validation error: {str(e)}"
+        
+    def validate_schema(self, timeout: int = 10) -> bool:
+        """Validate XML against XSD schema with timeout"""
+        if not self.schema_file:
+            logger.warning("No schema file provided, skipping validation")
+            return True
+        
+        if not os.path.exists(self.schema_file):
+            logger.error(f"Schema file not found: {self.schema_file}")
+            return False
+            
+        try:
+            logger.info(f"Validating XML against schema: {self.schema_file}")
+            
+            # Parse schema file with error handling
+            try:
+                logger.info("Parsing XSD schema file...")
+                with open(self.schema_file, 'rb') as f:
+                    schema_content = f.read()
+                schema_root = etree.XML(schema_content)
+                schema = etree.XMLSchema(schema_root)
+                logger.info("✓ Schema file parsed successfully")
+            except etree.XMLSchemaParseError as e:
+                logger.error(f"✗ Invalid XSD schema structure: {str(e)}")
+                return False
+            except etree.XMLSyntaxError as e:
+                logger.error(f"✗ Schema file syntax error: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"✗ Error reading schema file: {str(e)}")
+                return False
+            
+            # Parse XML file with error handling
+            try:
+                logger.info("Parsing XML data file...")
+                xml_doc = etree.parse(self.xml_file)
+                logger.info("✓ XML file parsed successfully")
+            except etree.XMLSyntaxError as e:
+                logger.error(f"✗ Invalid XML file syntax: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"✗ Error reading XML file: {str(e)}")
+                return False
+            
+            # Validate with timeout
+            logger.info(f"Starting validation (timeout: {timeout}s)...")
+            is_valid, error_msg = self._validate_with_timeout(schema, xml_doc, timeout)
+            
+            if is_valid:
+                logger.info("✓ XML schema validation: PASSED")
+                return True
+            else:
+                logger.error("✗ XML schema validation: FAILED")
+                if error_msg:
+                    logger.error(f"Validation errors:\n  {error_msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"✗ Unexpected schema validation error: {str(e)}")
+            return False
