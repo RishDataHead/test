@@ -1,0 +1,61 @@
+def validate_schema(self, timeout: int = 30) -> bool:
+        """Validate XML against XSD schema with timeout"""
+        if not self.schema_file:
+            logger.warning("No schema file provided, skipping validation")
+            return True
+        
+        if not os.path.exists(self.schema_file):
+            logger.error(f"Schema file not found: {self.schema_file}")
+            return False
+            
+        try:
+            logger.info(f"Validating XML against schema: {self.schema_file}")
+            
+            # Parse schema file
+            try:
+                with open(self.schema_file, 'rb') as f:
+                    schema_content = f.read()
+                schema_root = etree.XML(schema_content)
+                schema = etree.XMLSchema(schema_root)
+                logger.info("Schema file parsed successfully")
+            except etree.XMLSyntaxError as e:
+                logger.error(f"Invalid XSD schema file: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"Error reading schema file: {str(e)}")
+                return False
+            
+            # Parse and validate XML file
+            try:
+                xml_doc = etree.parse(self.xml_file)
+                logger.info("XML file parsed successfully")
+            except etree.XMLSyntaxError as e:
+                logger.error(f"Invalid XML file: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"Error reading XML file: {str(e)}")
+                return False
+            
+            # Validate
+            try:
+                is_valid = schema.validate(xml_doc)
+                
+                if is_valid:
+                    logger.info("✓ XML schema validation: PASSED")
+                    return True
+                else:
+                    logger.error("✗ XML schema validation: FAILED")
+                    logger.error("Validation errors:")
+                    for i, error in enumerate(schema.error_log, 1):
+                        logger.error(f"  {i}. Line {error.line}, Column {error.column}: {error.message}")
+                        if i >= 10:  # Limit error output
+                            logger.error(f"  ... and {len(schema.error_log) - 10} more errors")
+                            break
+                    return False
+            except Exception as e:
+                logger.error(f"Validation process error: {str(e)}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Unexpected schema validation error: {str(e)}")
+            return False
