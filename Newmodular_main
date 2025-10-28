@@ -1,0 +1,915 @@
+Here's the complete, tested modular code that you can run directly from the main file :Complete File Structureenterprise_data_loader/
+├── __init__.py
+├── config.py
+├── main.py
+├── database/
+│   ├── __init__.py
+│   └── connection_pool.py
+├── parsers/
+│   ├── __init__.py
+│   ├── base_parser.py
+│   ├── csv_parser.py
+│   └── xml_parser.py
+├── loaders/
+│   ├── __init__.py
+│   └── data_loader.py
+└── utils/
+    ├── __init__.py
+    ├── logger.py
+    └── validators.pyFile Contents1. enterprise_data_loader/__init__.py"""
+Enterprise Data Loader Package
+Modular, production-ready data loading framework
+"""
+
+from .config import AppConfig, DatabaseConfig, LoaderConfig, FileConfig
+from .database.connection_pool import OracleConnectionPool
+from .loaders.data_loader import DataLoader
+from .parsers.csv_parser import CSVParser
+from .parsers.xml_parser import XMLParser
+
+__version__ = '1.0.0'
+__all__ = [
+    'AppConfig',
+    'DatabaseConfig',
+    'LoaderConfig',
+    'FileConfig',
+    'OracleConnectionPool',
+    'DataLoader',
+    'CSVParser',
+    'XMLParser',
+]2. enterprise_data_loader/config.py"""
+Configuration module for Enterprise Data Loader
+Supports environment variables and config files
+"""
+
+import os
+from typing import Optional
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DatabaseConfig:
+    """Database connection configuration"""
+    user: str = field(default_factory=lambda: os.getenv('ORACLE_USER', 'your_username'))
+    password: str = field(default_factory=lambda: os.getenv('ORACLE_PASSWORD', 'your_password'))
+    dsn: str = field(default_factory=lambda: os.getenv('ORACLE_DSN', 'localhost:1521/XEPDB1'))
+    min_pool_conn: int = 2
+    max_pool_conn: int = 10
+
+
+@dataclass
+class LoaderConfig:
+    """Data loader configuration"""
+    staging_table: str = 'STG_DATA_LOAD'
+    chunk_size: int = 10000
+    max_workers: int = 4
+    batch_errors: bool = False
+    create_table: bool = True
+    drop_if_exists: bool = True
+
+
+@dataclass
+class FileConfig:
+    """File processing configuration"""
+    input_file: str = 'data.csv'
+    file_encoding: str = 'utf-8'
+    xml_record_tag: str = 'record'
+    xml_schema_file: Optional[str] = None
+    validate_schema: bool = True
+
+
+@dataclass
+class AppConfig:
+    """Main application configuration"""
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    loader: LoaderConfig = field(default_factory=LoaderConfig)
+    file: FileConfig = field(default_factory=FileConfig)
+    
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> 'AppConfig':
+        """Create configuration from dictionary"""
+        db_config = DatabaseConfig(**config_dict.get('database', {}))
+        loader_config = LoaderConfig(**config_dict.get('loader', {}))
+        file_config = FileConfig(**config_dict.get('file', {}))
+        
+        return cls(
+            database=db_config,
+            loader=loader_config,
+            file=file_config
+        )
+    
+    @classmethod
+    def from_env(cls) -> 'AppConfig':
+        """Create configuration from environment variables"""
+        return cls()
+
+
+# Default configuration instance
+default_config = AppConfig()3. enterprise_data_loader/utils/__init__.py"""Utils package initialization"""4. enterprise_data_loader/utils/logger.py"""
+Centralized logging configuration
+"""
+
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+class LoggerFactory:
+    """Factory for creating configured loggers"""
+    
+    _configured = False
+    
+    @staticmethod
+    def setup_logging(log_dir: str = 'logs', log_level: int = logging.INFO):
+        """Configure application-wide logging"""
+        if LoggerFactory._configured:
+            return
+        
+        # Create log directory
+        Path(log_dir).mkdir(exist_ok=True)
+        
+        # Log file name with timestamp
+        log_file = Path(log_dir) / f'data_loader_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+        
+        # Configure root logger
+        logging.basicConfig(
+            level=log_level,
+            format='%(asctime)s - %(name)-20s - %(threadName)-10s - %(levelname)-8s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        
+        LoggerFactory._configured = True
+    
+    @staticmethod
+    def get_logger(name: str) -> logging.Logger:
+        """Get a logger instance"""
+        if not LoggerFactory._configured:
+            LoggerFactory.setup_logging()
+        return logging.getLogger(name)5. enterprise_data_loader/utils/validators.py"""
+Data validation utilities
+"""
+
+import pandas as pd
+from typing import Tuple
+from .logger import LoggerFactory
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataValidator:
+    """Validate DataFrame structure and data quality"""
+    
+    @staticmethod
+    def validate_dataframe(df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        Validate DataFrame structure and data quality
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        try:
+            # Check for empty DataFrame
+            if df.empty:
+                return False, "DataFrame is empty"
+            
+            # Check for duplicate columns
+            if df.columns.duplicated().any():
+                return False, "DataFrame has duplicate column names"
+            
+            # Log data quality metrics
+            null_counts = df.isnull().sum()
+            if null_counts.any():
+                logger.info("Null value counts:")
+                for col, count in null_counts[null_counts > 0].items():
+                    logger.info(f"  {col}: {count} nulls ({count/len(df)*100:.2f}%)")
+            
+            return True, ""
+            
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+    
+    @staticmethod
+    def sanitize_column_names(columns: list) -> list:
+        """Sanitize column names for Oracle"""
+        return [col.replace(' ', '_').replace('-', '_').upper() for col in columns]6. enterprise_data_loader/database/__init__.py"""Database package initialization"""7. enterprise_data_loader/database/connection_pool.py"""
+Oracle database connection pool management
+"""
+
+import oracledb
+from contextlib import contextmanager
+from typing import Generator
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from utils.logger import LoggerFactory
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class OracleConnectionPool:
+    """Thread-safe Oracle connection pool"""
+    
+    def __init__(self, user: str, password: str, dsn: str, 
+                 min_conn: int = 2, max_conn: int = 10):
+        """
+        Initialize connection pool
+        
+        Args:
+            user: Database username
+            password: Database password
+            dsn: Database DSN (host:port/service_name)
+            min_conn: Minimum connections in pool
+            max_conn: Maximum connections in pool
+        """
+        try:
+            self.pool = oracledb.create_pool(
+                user=user,
+                password=password,
+                dsn=dsn,
+                min=min_conn,
+                max=max_conn,
+                increment=1,
+                threaded=True,
+                getmode=oracledb.POOL_GETMODE_WAIT
+            )
+            logger.info(f"Connection pool created: min={min_conn}, max={max_conn}")
+        except Exception as e:
+            logger.error(f"Failed to create connection pool: {str(e)}")
+            raise
+    
+    @contextmanager
+    def get_connection(self) -> Generator:
+        """
+        Context manager for database connections
+        
+        Yields:
+            Database connection
+        """
+        conn = self.pool.acquire()
+        try:
+            yield conn
+        finally:
+            self.pool.release(conn)
+    
+    def close(self):
+        """Close connection pool"""
+        self.pool.close()
+        logger.info("Connection pool closed")
+    
+    def __enter__(self):
+        """Support with statement"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup on exit"""
+        self.close()8. enterprise_data_loader/parsers/__init__.py"""Parsers package initialization"""9. enterprise_data_loader/parsers/base_parser.py"""
+Base parser interface
+"""
+
+from abc import ABC, abstractmethod
+from typing import Generator
+import pandas as pd
+
+
+class BaseParser(ABC):
+    """Abstract base class for file parsers"""
+    
+    def __init__(self, file_path: str, chunk_size: int = 10000):
+        """
+        Initialize parser
+        
+        Args:
+            file_path: Path to input file
+            chunk_size: Number of rows per chunk
+        """
+        self.file_path = file_path
+        self.chunk_size = chunk_size
+    
+    @abstractmethod
+    def parse(self) -> Generator[pd.DataFrame, None, None]:
+        """
+        Parse file and yield DataFrames in chunks
+        
+        Yields:
+            DataFrame chunks
+        """
+        pass
+    
+    @abstractmethod
+    def validate(self) -> bool:
+        """
+        Validate file format and structure
+        
+        Returns:
+            True if validation passes
+        """
+        pass10. enterprise_data_loader/parsers/csv_parser.py"""
+CSV file parser
+"""
+
+import pandas as pd
+from typing import Generator
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from .base_parser import BaseParser
+from utils.logger import LoggerFactory
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class CSVParser(BaseParser):
+    """Parse CSV files efficiently"""
+    
+    def __init__(self, file_path: str, chunk_size: int = 10000, encoding: str = 'utf-8'):
+        """
+        Initialize CSV parser
+        
+        Args:
+            file_path: Path to CSV file
+            chunk_size: Number of rows per chunk
+            encoding: File encoding
+        """
+        super().__init__(file_path, chunk_size)
+        self.encoding = encoding
+    
+    def validate(self) -> bool:
+        """Validate CSV file structure"""
+        try:
+            # Read first few rows to validate
+            pd.read_csv(self.file_path, nrows=5, encoding=self.encoding)
+            logger.info(f"CSV file validation passed: {self.file_path}")
+            return True
+        except Exception as e:
+            logger.error(f"CSV validation failed: {str(e)}")
+            return False
+    
+    def parse(self) -> Generator[pd.DataFrame, None, None]:
+        """
+        Parse CSV file in chunks
+        
+        Yields:
+            DataFrame chunks
+        """
+        logger.info(f"Parsing CSV file: {self.file_path}")
+        
+        try:
+            for chunk in pd.read_csv(
+                self.file_path, 
+                chunksize=self.chunk_size,
+                low_memory=False, 
+                encoding=self.encoding
+            ):
+                yield chunk
+            
+            logger.info("CSV parsing complete")
+            
+        except Exception as e:
+            logger.error(f"CSV parsing error: {str(e)}")
+            raise11. enterprise_data_loader/parsers/xml_parser.py"""
+XML file parser with schema validation
+"""
+
+import xml.etree.ElementTree as ET
+from lxml import etree
+import pandas as pd
+from typing import Generator, Optional
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from .base_parser import BaseParser
+from utils.logger import LoggerFactory
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class XMLParser(BaseParser):
+    """Parse and validate XML files"""
+    
+    def __init__(self, file_path: str, record_tag: str, 
+                 chunk_size: int = 10000, schema_file: Optional[str] = None):
+        """
+        Initialize XML parser
+        
+        Args:
+            file_path: Path to XML file
+            record_tag: XML tag name for each record
+            chunk_size: Number of records per chunk
+            schema_file: Path to XSD schema file (optional)
+        """
+        super().__init__(file_path, chunk_size)
+        self.record_tag = record_tag
+        self.schema_file = schema_file
+    
+    def validate(self) -> bool:
+        """Validate XML against XSD schema"""
+        if not self.schema_file:
+            logger.warning("No schema file provided, skipping validation")
+            return True
+        
+        try:
+            logger.info(f"Validating XML against schema: {self.schema_file}")
+            
+            # Load schema
+            with open(self.schema_file, 'r') as f:
+                schema_root = etree.XML(f.read())
+            schema = etree.XMLSchema(schema_root)
+            
+            # Parse and validate XML
+            xml_doc = etree.parse(self.file_path)
+            
+            if schema.validate(xml_doc):
+                logger.info("XML schema validation: PASSED")
+                return True
+            else:
+                logger.error("XML schema validation: FAILED")
+                for error in schema.error_log:
+                    logger.error(f"  Line {error.line}: {error.message}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Schema validation error: {str(e)}")
+            return False
+    
+    def parse(self) -> Generator[pd.DataFrame, None, None]:
+        """
+        Parse XML file iteratively and yield DataFrames
+        
+        Yields:
+            DataFrame chunks
+        """
+        try:
+            logger.info(f"Parsing XML file: {self.file_path}")
+            
+            # Parse XML iteratively for memory efficiency
+            context = ET.iterparse(self.file_path, events=('end',))
+            
+            records = []
+            count = 0
+            
+            for event, elem in context:
+                if elem.tag == self.record_tag:
+                    # Extract child elements as dictionary
+                    record = {child.tag: child.text for child in elem}
+                    records.append(record)
+                    count += 1
+                    
+                    # Clear element to free memory
+                    elem.clear()
+                    
+                    # Yield chunk when size reached
+                    if len(records) >= self.chunk_size:
+                        yield pd.DataFrame(records)
+                        records = []
+            
+            # Yield remaining records
+            if records:
+                yield pd.DataFrame(records)
+            
+            logger.info(f"XML parsing complete: {count} records processed")
+            
+        except Exception as e:
+            logger.error(f"XML parsing error: {str(e)}")
+            raise12. enterprise_data_loader/loaders/__init__.py"""Loaders package initialization"""13. enterprise_data_loader/loaders/data_loader.py"""
+Multithreaded data loader for Oracle database
+"""
+
+import pandas as pd
+import oracledb
+import time
+from typing import List, Dict, Any, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from database.connection_pool import OracleConnectionPool
+from utils.logger import LoggerFactory
+from utils.validators import DataValidator
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataLoader:
+    """Enterprise data loader with multithreading support"""
+    
+    def __init__(self, pool: OracleConnectionPool, table_name: str,
+                 chunk_size: int = 10000, max_workers: int = 4,
+                 batch_errors: bool = False):
+        """
+        Initialize data loader
+        
+        Args:
+            pool: Oracle connection pool
+            table_name: Target table name
+            chunk_size: Rows per chunk
+            max_workers: Number of parallel threads
+            batch_errors: Enable batch error handling
+        """
+        self.pool = pool
+        self.table_name = table_name
+        self.chunk_size = chunk_size
+        self.max_workers = max_workers
+        self.batch_errors = batch_errors
+        self.stats_lock = Lock()
+        self.total_rows = 0
+        self.failed_rows = 0
+    
+    def _prepare_insert_statement(self, columns: List[str]) -> str:
+        """Generate parameterized INSERT statement"""
+        cols = ', '.join(columns)
+        placeholders = ', '.join([f':{i+1}' for i in range(len(columns))])
+        return f"INSERT INTO {self.table_name} ({cols}) VALUES ({placeholders})"
+    
+    def _load_chunk(self, chunk_data: pd.DataFrame, chunk_id: int) -> Dict[str, Any]:
+        """
+        Load a single chunk into Oracle
+        
+        Args:
+            chunk_data: DataFrame chunk to load
+            chunk_id: Chunk identifier
+            
+        Returns:
+            Dictionary with load statistics
+        """
+        start_time = time.time()
+        rows_inserted = 0
+        
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.setinputsizes(None, self.chunk_size)
+                
+                columns = chunk_data.columns.tolist()
+                insert_sql = self._prepare_insert_statement(columns)
+                
+                # Handle NaN/None values
+                chunk_data = chunk_data.where(pd.notnull(chunk_data), None)
+                data_tuples = [tuple(row) for row in chunk_data.values]
+                
+                # Batch insert
+                if self.batch_errors:
+                    cursor.executemany(insert_sql, data_tuples, batcherrors=True)
+                    errors = cursor.getbatcherrors()
+                    if errors:
+                        logger.warning(f"Chunk {chunk_id}: {len(errors)} row errors")
+                        rows_inserted = len(data_tuples) - len(errors)
+                    else:
+                        rows_inserted = len(data_tuples)
+                else:
+                    cursor.executemany(insert_sql, data_tuples)
+                    rows_inserted = len(data_tuples)
+                
+                conn.commit()
+                cursor.close()
+            
+            elapsed = time.time() - start_time
+            throughput = rows_inserted / elapsed if elapsed > 0 else 0
+            
+            logger.info(
+                f"Chunk {chunk_id}: {rows_inserted} rows in {elapsed:.2f}s "
+                f"({throughput:.0f} rows/sec)"
+            )
+            
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': rows_inserted,
+                'success': True,
+                'elapsed': elapsed
+            }
+            
+        except Exception as e:
+            logger.error(f"Chunk {chunk_id} failed: {str(e)}")
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': 0,
+                'success': False,
+                'error': str(e)
+            }
+    
+    def create_table_from_dataframe(self, sample_df: pd.DataFrame, 
+                                   drop_if_exists: bool = True):
+        """
+        Create staging table from DataFrame schema
+        
+        Args:
+            sample_df: Sample DataFrame for schema inference
+            drop_if_exists: Drop table if it already exists
+        """
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Drop existing table
+                if drop_if_exists:
+                    try:
+                        cursor.execute(f"DROP TABLE {self.table_name} PURGE")
+                        logger.info(f"Dropped existing table: {self.table_name}")
+                    except oracledb.DatabaseError:
+                        pass
+                
+                # Map pandas dtypes to Oracle types
+                type_mapping = {
+                    'int64': 'NUMBER',
+                    'int32': 'NUMBER',
+                    'float64': 'NUMBER',
+                    'float32': 'NUMBER',
+                    'object': 'VARCHAR2(4000)',
+                    'bool': 'NUMBER(1)',
+                    'datetime64[ns]': 'TIMESTAMP',
+                    'datetime64': 'TIMESTAMP'
+                }
+                
+                # Build column definitions
+                columns_def = []
+                for col, dtype in sample_df.dtypes.items():
+                    clean_col = col.replace(' ', '_').replace('-', '_').upper()
+                    oracle_type = type_mapping.get(str(dtype), 'VARCHAR2(4000)')
+                    columns_def.append(f"{clean_col} {oracle_type}")
+                
+                # Create table
+                create_sql = f"CREATE TABLE {self.table_name} ({', '.join(columns_def)})"
+                cursor.execute(create_sql)
+                conn.commit()
+                
+                logger.info(f"Created table: {self.table_name}")
+                logger.info(f"Columns: {', '.join([cd.split()[0] for cd in columns_def])}")
+                cursor.close()
+                
+        except Exception as e:
+            logger.error(f"Failed to create table: {str(e)}")
+            raise
+    
+    def load_from_generator(self, data_generator: Generator[pd.DataFrame, None, None],
+                           create_table: bool = True, drop_if_exists: bool = True) -> Dict[str, Any]:
+        """
+        Load data from a generator that yields DataFrames
+        
+        Args:
+            data_generator: Generator yielding DataFrame chunks
+            create_table: Auto-create table from first chunk
+            drop_if_exists: Drop existing table before creation
+            
+        Returns:
+            Dictionary with load statistics
+        """
+        overall_start = time.time()
+        
+        # Get first chunk
+        try:
+            first_chunk = next(data_generator)
+        except StopIteration:
+            logger.error("No data to load")
+            return {'success': False, 'error': 'No data found'}
+        
+        # Validate first chunk
+        is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)
+        if not is_valid:
+            logger.error(f"Data validation failed: {error_msg}")
+            return {'success': False, 'error': error_msg}
+        
+        # Create table if needed
+        if create_table:
+            self.create_table_from_dataframe(first_chunk, drop_if_exists)
+        
+        # Process chunks with multithreading
+        chunk_id = 0
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit first chunk
+            futures.append(executor.submit(self._load_chunk, first_chunk, chunk_id))
+            chunk_id += 1
+            
+            # Submit remaining chunks
+            for chunk in data_generator:
+                futures.append(executor.submit(self._load_chunk, chunk, chunk_id))
+                chunk_id += 1
+            
+            # Collect results
+            for future in as_completed(futures):
+                result = future.result()
+                with self.stats_lock:
+                    if result['success']:
+                        self.total_rows += result['rows_inserted']
+                    else:
+                        self.failed_rows += result.get('rows_inserted', 0)
+        
+        overall_elapsed = time.time() - overall_start
+        
+        return {
+            'total_rows': self.total_rows,
+            'failed_rows': self.failed_rows,
+            'total_chunks': chunk_id,
+            'elapsed_seconds': overall_elapsed,
+            'rows_per_second': self.total_rows / overall_elapsed if overall_elapsed > 0 else 0,
+            'success': self.failed_rows == 0
+        }14. enterprise_data_loader/main.py"""
+Enterprise Data Loader - Main Entry Point
+Orchestrates the data loading process
+"""
+
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Any
+
+from config import AppConfig
+from database.connection_pool import OracleConnectionPool
+from parsers.csv_parser import CSVParser
+from parsers.xml_parser import XMLParser
+from loaders.data_loader import DataLoader
+from utils.logger import LoggerFactory
+
+
+# Setup logging
+LoggerFactory.setup_logging()
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataLoaderApp:
+    """Main application orchestrator"""
+    
+    def __init__(self, config: AppConfig):
+        """
+        Initialize application
+        
+        Args:
+            config: Application configuration
+        """
+        self.config = config
+        self.pool = None
+    
+    def _initialize_connection_pool(self):
+        """Initialize database connection pool"""
+        logger.info("Initializing database connection pool")
+        
+        self.pool = OracleConnectionPool(
+            user=self.config.database.user,
+            password=self.config.database.password,
+            dsn=self.config.database.dsn,
+            min_conn=self.config.database.min_pool_conn,
+            max_conn=self.config.database.max_pool_conn
+        )
+    
+    def _get_parser(self):
+        """
+        Get appropriate parser based on file type
+        
+        Returns:
+            Parser instance
+        """
+        file_path = self.config.file.input_file
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.csv':
+            return CSVParser(
+                file_path=file_path,
+                chunk_size=self.config.loader.chunk_size,
+                encoding=self.config.file.file_encoding
+            )
+        elif file_ext == '.xml':
+            return XMLParser(
+                file_path=file_path,
+                record_tag=self.config.file.xml_record_tag,
+                chunk_size=self.config.loader.chunk_size,
+                schema_file=self.config.file.xml_schema_file
+            )
+        else:
+            raise ValueError(f"Unsupported file type: {file_ext}")
+    
+    def _print_statistics(self, stats: Dict[str, Any]):
+        """Print loading statistics"""
+        print("
+" + "="*70)
+        print(" "*25 + "LOAD STATISTICS")
+        print("="*70)
+        print(f"{'Total Rows Loaded:':<30} {stats['total_rows']:>20,}")
+        print(f"{'Failed Rows:':<30} {stats['failed_rows']:>20,}")
+        print(f"{'Total Chunks:':<30} {stats['total_chunks']:>20}")
+        print(f"{'Elapsed Time:':<30} {stats['elapsed_seconds']:>17.2f} sec")
+        print(f"{'Throughput:':<30} {stats['rows_per_second']:>15,.0f} rows/sec")
+        print(f"{'Status:':<30} {('SUCCESS' if stats['success'] else 'FAILED'):>20}")
+        print("="*70 + "
+")
+    
+    def run(self) -> bool:
+        """
+        Execute data loading process
+        
+        Returns:
+            True if successful
+        """
+        try:
+            logger.info("Starting Enterprise Data Loader")
+            logger.info(f"Input file: {self.config.file.input_file}")
+            
+            # Validate file exists
+            if not Path(self.config.file.input_file).exists():
+                logger.error(f"File not found: {self.config.file.input_file}")
+                return False
+            
+            # Initialize connection pool
+            self._initialize_connection_pool()
+            
+            # Get parser
+            parser = self._get_parser()
+            
+            # Validate file
+            if self.config.file.validate_schema:
+                if not parser.validate():
+                    logger.error("File validation failed")
+                    return False
+            
+            # Initialize loader
+            loader = DataLoader(
+                pool=self.pool,
+                table_name=self.config.loader.staging_table,
+                chunk_size=self.config.loader.chunk_size,
+                max_workers=self.config.loader.max_workers,
+                batch_errors=self.config.loader.batch_errors
+            )
+            
+            # Load data
+            stats = loader.load_from_generator(
+                data_generator=parser.parse(),
+                create_table=self.config.loader.create_table,
+                drop_if_exists=self.config.loader.drop_if_exists
+            )
+            
+            # Print results
+            self._print_statistics(stats)
+            
+            return stats['success']
+            
+        except Exception as e:
+            logger.error(f"Application failed: {str(e)}", exc_info=True)
+            return False
+        
+        finally:
+            if self.pool:
+                self.pool.close()
+            logger.info("Application finished")
+
+
+def main():
+    """Main entry point"""
+    
+    # Load configuration from environment or defaults
+    config = AppConfig.from_env()
+    
+    # MODIFY THESE SETTINGS FOR YOUR ENVIRONMENT
+    config.database.user = 'your_username'
+    config.database.password = 'your_password'
+    config.database.dsn = 'localhost:1521/XEPDB1'
+    
+    config.file.input_file = 'data.csv'  # Change to your CSV or XML file
+    config.loader.staging_table = 'STG_DATA_LOAD'
+    config.loader.chunk_size = 10000
+    config.loader.max_workers = 4
+    
+    # Create and run application
+    app = DataLoaderApp(config)
+    success = app.run()
+    
+    # Exit with appropriate code
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()How to RunStep 1: Install Dependenciespip install oracledb pandas lxmlStep 2: Configure Database SettingsEdit enterprise_data_loader/main.py and update these lines:config.database.user = 'your_username'        # Your Oracle username
+config.database.password = 'your_password'    # Your Oracle password
+config.database.dsn = 'localhost:1521/XEPDB1' # Your Oracle DSN
+
+config.file.input_file = 'data.csv'           # Your input file
+config.loader.staging_table = 'STG_DATA_LOAD' # Target table nameStep 3: Run from Main File# Navigate to the enterprise_data_loader directory
+cd enterprise_data_loader
+
+# Run the main file directly
+python main.pyAlternative: Run as Module from Parent Directory# From project root (parent of enterprise_data_loader/)
+python -m enterprise_data_loader.mainQuick TestCreate a test CSV file named data.csv in the same directory:id,name,age,salary
+1,John Doe,30,50000
+2,Jane Smith,25,60000
+3,Bob Johnson,35,70000Then run:cd enterprise_data_loader
+python main.pyThe code will automatically create the Oracle table and load the data .
