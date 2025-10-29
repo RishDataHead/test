@@ -1,0 +1,516 @@
+Perfect! I'll remove CSV saving and add detailed logging. Here's the simplified version - ONE FILE to change :File: enterprise_data_loader/loaders/data_loader.py"""
+Multithreaded data loader with atomic all-or-nothing loading and detailed logging
+No CSV saving - only logs failed chunks
+"""
+
+import pandas as pd
+import oracledb
+import time
+from typing import List, Dict, Any, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Event
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from database.connection_pool import OracleConnectionPool
+from utils.logger import LoggerFactory
+from utils.validators import DataValidator
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataLoader:
+    """Enterprise data loader with atomic all-or-nothing loading"""
+    
+    def __init__(self, pool: OracleConnectionPool, table_name: str,
+                 chunk_size: int = 10000, max_workers: int = 4,
+                 batch_errors: bool = False, atomic_load: bool = True):
+        """
+        Initialize data loader
+        
+        Args:
+            pool: Oracle connection pool
+            table_name: Target table name
+            chunk_size: Rows per chunk
+            max_workers: Number of parallel threads
+            batch_errors: Enable batch error handling
+            atomic_load: If True, rollback all on any failure (all-or-nothing)
+        """
+        self.pool = pool
+        self.table_name = table_name
+        self.chunk_size = chunk_size
+        self.max_workers = max_workers
+        self.batch_errors = batch_errors
+        self.atomic_load = atomic_load
+        
+        self.stats_lock = Lock()
+        self.total_rows = 0
+        self.failed_rows = 0
+        self.failed_chunks = []
+        
+        # Event to signal failure and stop other chunks
+        self.failure_event = Event()
+        self.first_failure_info = None
+        
+        logger.info("="*70)
+        logger.info("DataLoader initialized with configuration:")
+        logger.info(f"  Table: {table_name}")
+        logger.info(f"  Chunk Size: {chunk_size:,} rows")
+        logger.info(f"  Max Workers: {max_workers}")
+        logger.info(f"  Batch Errors: {batch_errors}")
+        logger.info(f"  Atomic Load: {atomic_load} (All-or-Nothing)")
+        logger.info("="*70)
+    
+    def _prepare_insert_statement(self, columns: List[str]) -> str:
+        """Generate parameterized INSERT statement"""
+        cols = ', '.join(columns)
+        placeholders = ', '.join([f':{i+1}' for i in range(len(columns))])
+        sql = f"INSERT INTO {self.table_name} ({cols}) VALUES ({placeholders})"
+        logger.debug(f"Generated INSERT statement: {sql}")
+        return sql
+    
+    def _truncate_table(self):
+        """Truncate the table to remove all data"""
+        logger.warning("="*70)
+        logger.warning("INITIATING TABLE TRUNCATION")
+        logger.warning(f"Table: {self.table_name}")
+        logger.warning("="*70)
+        
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                truncate_sql = f"TRUNCATE TABLE {self.table_name}"
+                logger.info(f"Executing: {truncate_sql}")
+                cursor.execute(truncate_sql)
+                conn.commit()
+                cursor.close()
+                logger.warning(f"✓ Table {self.table_name} successfully TRUNCATED")
+                logger.warning("  All previously inserted data has been removed")
+        except Exception as e:
+            logger.error(f"✗ TRUNCATE failed: {str(e)}")
+            logger.warning("  Attempting DELETE as fallback...")
+            # Try DELETE if TRUNCATE fails
+            try:
+                with self.pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    delete_sql = f"DELETE FROM {self.table_name}"
+                    logger.info(f"Executing: {delete_sql}")
+                    cursor.execute(delete_sql)
+                    conn.commit()
+                    cursor.close()
+                    logger.warning(f"✓ Table {self.table_name} cleared using DELETE")
+            except Exception as e2:
+                logger.critical(f"✗ DELETE also failed: {str(e2)}")
+                logger.critical("  CRITICAL: Unable to clean table - manual intervention required!")
+        
+        logger.warning("="*70)
+    
+    def _log_chunk_failure_details(self, chunk_id: int, chunk_data: pd.DataFrame, 
+                                   error_message: str, batch_errors: list = None):
+        """Log detailed information about chunk failure"""
+        logger.error("="*70)
+        logger.error(f"CHUNK {chunk_id} FAILURE DETAILS")
+        logger.error("="*70)
+        logger.error(f"Chunk ID: {chunk_id}")
+        logger.error(f"Total rows in chunk: {len(chunk_data)}")
+        logger.error(f"Error type: {error_message}")
+        logger.error(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.error(f"Table: {self.table_name}")
+        
+        if batch_errors:
+            logger.error(f"Number of failed rows: {len(batch_errors)}")
+            logger.error("
+Failed row details (first 10):")
+            for i, err in enumerate(batch_errors[:10]):
+                logger.error(f"  Row {err.offset}: {err.message}")
+            if len(batch_errors) > 10:
+                logger.error(f"  ... and {len(batch_errors) - 10} more row errors")
+        
+        # Log sample of failed data
+        logger.error("
+Sample data from failed chunk (first 5 rows):")
+        for idx, row in chunk_data.head(5).iterrows():
+            logger.error(f"  Row {idx}: {row.to_dict()}")
+        
+        logger.error("="*70)
+    
+    def _load_chunk(self, chunk_data: pd.DataFrame, chunk_id: int) -> Dict[str, Any]:
+        """
+        Load a single chunk into Oracle with detailed logging
+        """
+        logger.info("-"*70)
+        logger.info(f"CHUNK {chunk_id} - Starting load")
+        logger.info(f"  Rows to load: {len(chunk_data)}")
+        logger.info(f"  Thread: {threading.current_thread().name}")
+        
+        # Check if another chunk has already failed
+        if self.atomic_load and self.failure_event.is_set():
+            logger.warning(f"CHUNK {chunk_id} - SKIPPED (another chunk failed)")
+            logger.warning(f"  Rows skipped: {len(chunk_data)}")
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': 0,
+                'rows_failed': 0,
+                'total_rows': len(chunk_data),
+                'success': False,
+                'skipped': True,
+                'elapsed': 0
+            }
+        
+        start_time = time.time()
+        rows_inserted = 0
+        rows_failed = 0
+        total_rows_in_chunk = len(chunk_data)
+        error_message = None
+        
+        try:
+            logger.debug(f"CHUNK {chunk_id} - Acquiring database connection")
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.setinputsizes(None, self.chunk_size)
+                
+                columns = chunk_data.columns.tolist()
+                logger.debug(f"CHUNK {chunk_id} - Columns: {columns}")
+                insert_sql = self._prepare_insert_statement(columns)
+                
+                chunk_data_clean = chunk_data.where(pd.notnull(chunk_data), None)
+                data_tuples = [tuple(row) for row in chunk_data_clean.values]
+                
+                logger.debug(f"CHUNK {chunk_id} - Executing batch insert")
+                
+                if self.batch_errors:
+                    cursor.executemany(insert_sql, data_tuples, batcherrors=True)
+                    errors = cursor.getbatcherrors()
+                    
+                    if errors:
+                        rows_failed = len(errors)
+                        rows_inserted = len(data_tuples) - len(errors)
+                        error_message = f"{rows_failed} row-level batch errors"
+                        
+                        # Log detailed failure
+                        self._log_chunk_failure_details(chunk_id, chunk_data, error_message, errors)
+                        
+                        # Signal failure in atomic mode
+                        if self.atomic_load:
+                            logger.critical(f"CHUNK {chunk_id} - TRIGGERING ATOMIC ROLLBACK")
+                            self.failure_event.set()
+                            with self.stats_lock:
+                                if self.first_failure_info is None:
+                                    self.first_failure_info = {
+                                        'chunk_id': chunk_id,
+                                        'error': error_message,
+                                        'rows_failed': rows_failed,
+                                        'total_rows': total_rows_in_chunk
+                                    }
+                    else:
+                        rows_inserted = len(data_tuples)
+                        logger.info(f"CHUNK {chunk_id} - All rows inserted successfully")
+                else:
+                    cursor.executemany(insert_sql, data_tuples)
+                    rows_inserted = len(data_tuples)
+                    logger.info(f"CHUNK {chunk_id} - All rows inserted successfully")
+                
+                logger.debug(f"CHUNK {chunk_id} - Committing transaction")
+                conn.commit()
+                cursor.close()
+            
+            elapsed = time.time() - start_time
+            throughput = rows_inserted / elapsed if elapsed > 0 else 0
+            
+            if rows_failed == 0:
+                logger.info(f"CHUNK {chunk_id} - ✓ SUCCESS")
+                logger.info(f"  Rows inserted: {rows_inserted:,}")
+                logger.info(f"  Time taken: {elapsed:.2f} seconds")
+                logger.info(f"  Throughput: {throughput:,.0f} rows/sec")
+            else:
+                logger.error(f"CHUNK {chunk_id} - ✗ PARTIAL FAILURE")
+                logger.error(f"  Rows inserted: {rows_inserted:,}")
+                logger.error(f"  Rows failed: {rows_failed:,}")
+                logger.error(f"  Time taken: {elapsed:.2f} seconds")
+            
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': rows_inserted,
+                'rows_failed': rows_failed,
+                'total_rows': total_rows_in_chunk,
+                'success': rows_failed == 0,
+                'skipped': False,
+                'elapsed': elapsed,
+                'error_message': error_message
+            }
+            
+        except Exception as e:
+            error_message = str(e)
+            elapsed = time.time() - start_time
+            
+            logger.error(f"CHUNK {chunk_id} - ✗ COMPLETE FAILURE")
+            logger.error(f"  Error: {error_message}")
+            logger.error(f"  Time taken: {elapsed:.2f} seconds")
+            
+            # Log detailed failure
+            self._log_chunk_failure_details(chunk_id, chunk_data, error_message)
+            
+            # Signal failure in atomic mode
+            if self.atomic_load:
+                logger.critical(f"CHUNK {chunk_id} - TRIGGERING ATOMIC ROLLBACK")
+                self.failure_event.set()
+                with self.stats_lock:
+                    if self.first_failure_info is None:
+                        self.first_failure_info = {
+                            'chunk_id': chunk_id,
+                            'error': error_message,
+                            'rows_failed': total_rows_in_chunk,
+                            'total_rows': total_rows_in_chunk
+                        }
+            
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': 0,
+                'rows_failed': total_rows_in_chunk,
+                'total_rows': total_rows_in_chunk,
+                'success': False,
+                'skipped': False,
+                'elapsed': elapsed,
+                'error_message': error_message
+            }
+    
+    def create_table_from_dataframe(self, sample_df: pd.DataFrame, 
+                                   drop_if_exists: bool = True):
+        """Create staging table from DataFrame schema"""
+        logger.info("="*70)
+        logger.info("TABLE CREATION")
+        logger.info(f"Table name: {self.table_name}")
+        
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if drop_if_exists:
+                    try:
+                        logger.info(f"Dropping existing table if exists...")
+                        cursor.execute(f"DROP TABLE {self.table_name} PURGE")
+                        logger.info(f"✓ Existing table {self.table_name} dropped")
+                    except oracledb.DatabaseError as e:
+                        logger.debug(f"Table does not exist (expected): {str(e)}")
+                
+                type_mapping = {
+                    'int64': 'NUMBER',
+                    'int32': 'NUMBER',
+                    'float64': 'NUMBER',
+                    'float32': 'NUMBER',
+                    'object': 'VARCHAR2(4000)',
+                    'bool': 'NUMBER(1)',
+                    'datetime64[ns]': 'TIMESTAMP',
+                    'datetime64': 'TIMESTAMP'
+                }
+                
+                columns_def = []
+                logger.info("Column definitions:")
+                for col, dtype in sample_df.dtypes.items():
+                    clean_col = col.replace(' ', '_').replace('-', '_').upper()
+                    oracle_type = type_mapping.get(str(dtype), 'VARCHAR2(4000)')
+                    columns_def.append(f"{clean_col} {oracle_type}")
+                    logger.info(f"  {clean_col}: {oracle_type} (from pandas {dtype})")
+                
+                create_sql = f"CREATE TABLE {self.table_name} ({', '.join(columns_def)})"
+                logger.debug(f"Create SQL: {create_sql}")
+                cursor.execute(create_sql)
+                conn.commit()
+                cursor.info(f"✓ Table {self.table_name} created successfully")
+                cursor.close()
+                
+        except Exception as e:
+            logger.error(f"✗ Failed to create table: {str(e)}")
+            logger.error("="*70)
+            raise
+        
+        logger.info("="*70)
+    
+    def load_from_generator(self, data_generator: Generator[pd.DataFrame, None, None],
+                           create_table: bool = True, drop_if_exists: bool = True) -> Dict[str, Any]:
+        """
+        Load data from a generator with atomic all-or-nothing guarantee
+        """
+        logger.info("="*70)
+        logger.info("STARTING DATA LOAD OPERATION")
+        logger.info("="*70)
+        
+        overall_start = time.time()
+        
+        # Reset state
+        self.failure_event.clear()
+        self.first_failure_info = None
+        self.total_rows = 0
+        self.failed_rows = 0
+        self.failed_chunks = []
+        
+        # Get first chunk
+        try:
+            logger.info("Reading first chunk...")
+            first_chunk = next(data_generator)
+            logger.info(f"✓ First chunk loaded: {len(first_chunk)} rows")
+        except StopIteration:
+            logger.error("✗ No data to load - file is empty")
+            return {
+                'success': False, 
+                'error': 'No data found', 
+                'total_rows': 0, 
+                'failed_rows': 0,
+                'failed_chunks': [],
+                'atomic_rollback': False
+            }
+        
+        # Validate first chunk
+        logger.info("Validating data...")
+        is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)
+        if not is_valid:
+            logger.error(f"✗ Data validation failed: {error_msg}")
+            return {
+                'success': False, 
+                'error': error_msg, 
+                'total_rows': 0, 
+                'failed_rows': 0,
+                'failed_chunks': [],
+                'atomic_rollback': False
+            }
+        logger.info("✓ Data validation passed")
+        
+        # Create table if needed
+        if create_table:
+            self.create_table_from_dataframe(first_chunk, drop_if_exists)
+        
+        logger.info("="*70)
+        logger.info(f"LOAD MODE: {'ATOMIC (All-or-Nothing)' if self.atomic_load else 'BEST EFFORT'}")
+        logger.info("="*70)
+        
+        # Process chunks with multithreading
+        chunk_id = 0
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit first chunk
+            logger.info(f"Submitting chunk {chunk_id} to thread pool")
+            futures.append(executor.submit(self._load_chunk, first_chunk, chunk_id))
+            chunk_id += 1
+            
+            # Submit remaining chunks
+            for chunk in data_generator:
+                # In atomic mode, stop submitting if failure occurred
+                if self.atomic_load and self.failure_event.is_set():
+                    logger.warning(f"Failure detected - stopping chunk submission at chunk {chunk_id}")
+                    break
+                
+                logger.info(f"Submitting chunk {chunk_id} to thread pool ({len(chunk)} rows)")
+                futures.append(executor.submit(self._load_chunk, chunk, chunk_id))
+                chunk_id += 1
+            
+            logger.info(f"Total chunks submitted: {chunk_id}")
+            logger.info("Waiting for all chunks to complete...")
+            
+            # Collect results
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                
+                logger.debug(f"Chunk {result['chunk_id']} completed ({completed}/{len(futures)})")
+                
+                with self.stats_lock:
+                    if not result.get('skipped', False):
+                        self.total_rows += result.get('rows_inserted', 0)
+                        self.failed_rows += result.get('rows_failed', 0)
+                        
+                        if result.get('rows_failed', 0) > 0:
+                            failed_chunk_info = {
+                                'chunk_id': result['chunk_id'],
+                                'rows_failed': result['rows_failed'],
+                                'total_rows': result['total_rows'],
+                                'error_message': result.get('error_message', 'Unknown error')
+                            }
+                            self.failed_chunks.append(failed_chunk_info)
+                
+                # In atomic mode, cancel remaining futures if failure detected
+                if self.atomic_load and self.failure_event.is_set():
+                    logger.warning("Cancelling remaining pending chunks...")
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                            logger.debug("Chunk cancelled")
+                    break
+        
+        overall_elapsed = time.time() - overall_start
+        
+        logger.info("="*70)
+        logger.info("ALL CHUNKS PROCESSED")
+        logger.info(f"Total rows successfully inserted: {self.total_rows:,}")
+        logger.info(f"Total rows failed: {self.failed_rows:,}")
+        logger.info(f"Total time: {overall_elapsed:.2f} seconds")
+        logger.info("="*70)
+        
+        # ATOMIC ROLLBACK: Truncate table if any failure occurred
+        atomic_rollback_performed = False
+        rows_before_rollback = self.total_rows
+        
+        if self.atomic_load and self.failed_rows > 0:
+            logger.error("="*70)
+            logger.error("ATOMIC LOAD FAILURE DETECTED")
+            logger.error("="*70)
+            logger.error(f"First failed chunk: {self.first_failure_info['chunk_id']}")
+            logger.error(f"Failure reason: {self.first_failure_info['error']}")
+            logger.error(f"Rows that were inserted: {rows_before_rollback:,}")
+            logger.error(f"Rows that failed: {self.failed_rows:,}")
+            logger.error("")
+            logger.error("Initiating atomic rollback...")
+            
+            self._truncate_table()
+            atomic_rollback_performed = True
+            self.total_rows = 0  # No data in table after rollback
+            
+            logger.error("="*70)
+            logger.error("ATOMIC ROLLBACK COMPLETED")
+            logger.error("Final state: Table is EMPTY - NO DATA was loaded")
+            logger.error("="*70)
+        
+        # Log failed chunks summary
+        if self.failed_chunks:
+            logger.error("="*70)
+            logger.error("FAILED CHUNKS SUMMARY")
+            logger.error("="*70)
+            for fc in self.failed_chunks:
+                logger.error(f"Chunk {fc['chunk_id']}: {fc['rows_failed']} rows failed - {fc['error_message']}")
+            logger.error(f"
+Total failed chunks: {len(self.failed_chunks)}")
+            logger.error(f"Failed chunk IDs: {[fc['chunk_id'] for fc in self.failed_chunks]}")
+            logger.error("="*70)
+        
+        result = {
+            'total_rows': self.total_rows,
+            'failed_rows': self.failed_rows,
+            'total_processed': rows_before_rollback + self.failed_rows,
+            'total_chunks': chunk_id,
+            'failed_chunks': self.failed_chunks,
+            'failed_chunk_ids': [fc['chunk_id'] for fc in self.failed_chunks],
+            'elapsed_seconds': overall_elapsed,
+            'rows_per_second': (rows_before_rollback + self.failed_rows) / overall_elapsed if overall_elapsed > 0 else 0,
+            'success': self.failed_rows == 0,
+            'atomic_rollback': atomic_rollback_performed,
+            'atomic_mode': self.atomic_load
+        }
+        
+        if atomic_rollback_performed:
+            result['rows_before_rollback'] = rows_before_rollback
+            result['first_failure'] = self.first_failure_info
+        
+        logger.info("="*70)
+        logger.info(f"LOAD OPERATION {'COMPLETED SUCCESSFULLY' if result['success'] else 'FAILED'}")
+        logger.info("="*70)
+        
+        return result
+
+
+# Add threading import at top of file
+import threadingKey Changes:Removed all CSV saving - No more _save_failed_chunk_to_csv() or file operationsRemoved error_output_dir - No directory creationAdded detailed logging throughout:Chunk start/end with row countsThread namesSQL statements (debug level)Connection acquisitionCommit operationsDetailed error logging with sample dataStep-by-step progressNew _log_chunk_failure_details() - Logs:Chunk IDTotal rowsError typeTimestampFirst 10 failed rows with errorsFirst 5 rows of data from failed chunkEnhanced console output with clear sections and status indicators (✓/✗)The logs will show exactly which chunks failed without saving any files !
