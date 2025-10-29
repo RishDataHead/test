@@ -1,0 +1,170 @@
+The error is happening because stats is None when there's an early failure. Here's the fix for enterprise_data_loader/main.py :Fix: enterprise_data_loader/main.pyReplace the _print_statistics method with this safer version:    def _print_statistics(self, stats: Dict[str, Any]):
+        """Print loading statistics with atomic rollback information"""
+        # Handle None or missing stats
+        if stats is None:
+            print("
+" + "="*70)
+            print("ERROR: No statistics available")
+            print("="*70 + "
+")
+            return
+        
+        print("
+" + "="*70)
+        print(" "*25 + "LOAD STATISTICS")
+        print("="*70)
+        
+        if stats.get('atomic_mode', False):
+            print(f"{'Load Mode:':<30} {'ATOMIC (All-or-Nothing)':>20}")
+        else:
+            print(f"{'Load Mode:':<30} {'BEST EFFORT':>20}")
+        
+        print(f"{'Total Rows Loaded:':<30} {stats.get('total_rows', 0):>20,}")
+        print(f"{'Failed Rows:':<30} {stats.get('failed_rows', 0):>20,}")
+        print(f"{'Total Processed:':<30} {stats.get('total_processed', 0):>20,}")
+        print(f"{'Total Chunks:':<30} {stats.get('total_chunks', 0):>20}")
+        print(f"{'Elapsed Time:':<30} {stats.get('elapsed_seconds', 0):>17.2f} sec")
+        print(f"{'Throughput:':<30} {stats.get('rows_per_second', 0):>15,.0f} rows/sec")
+        
+        if stats.get('atomic_rollback', False):
+            print("="*70)
+            print(" "*20 + "⚠️  ATOMIC ROLLBACK EXECUTED  ⚠️")
+            print("="*70)
+            print(f"{'Rows Before Rollback:':<30} {stats.get('rows_before_rollback', 0):>20,}")
+            print(f"{'Rows After Rollback:':<30} {0:>20,}")
+            
+            if stats.get('first_failure'):
+                print(f"{'First Failed Chunk:':<30} {stats['first_failure'].get('chunk_id', 'Unknown'):>20}")
+                print(f"{'Failure Reason:':<30}")
+                print(f"  {stats['first_failure'].get('error', 'Unknown error')}")
+            
+            print("="*70)
+            print(f"{'Final Status:':<30} {'❌ ALL DATA TRUNCATED':>20}")
+        else:
+            status = '✅ SUCCESS' if stats.get('success', False) else '❌ FAILED'
+            print(f"{'Status:':<30} {status:>20}")
+        
+        print("="*70)
+        
+        if stats.get('failed_chunks'):
+            print("
+" + "="*70)
+            print(" "*22 + "FAILED CHUNKS DETAILS")
+            print("="*70)
+            print(f"{'Chunk ID':<12} {'Rows Failed':<15} {'Error Message':<43}")
+            print("-"*70)
+            
+            for fc in stats.get('failed_chunks', []):
+                chunk_id = fc.get('chunk_id', 'Unknown')
+                rows_failed = fc.get('rows_failed', 0)
+                error_msg = fc.get('error_message', 'Unknown error')
+                error_msg = error_msg[:40] + '...' if len(error_msg) > 40 else error_msg
+                print(f"{chunk_id:<12} {rows_failed:<15} {error_msg:<43}")
+            
+            print("="*70)
+            print(f"
+Failed chunk IDs: {stats.get('failed_chunk_ids', [])}")
+            print(f"Failed data saved to: ./failed_data/")
+            
+            if stats.get('summary_file'):
+                print(f"Summary file: {stats.get('summary_file')}")
+            
+            if stats.get('atomic_rollback', False):
+                print("
+⚠️  NOTE: Table was TRUNCATED - NO DATA was loaded")
+        
+        # Show error message if present
+        if stats.get('error'):
+            print("
+" + "="*70)
+            print("ERROR DETAILS")
+            print("="*70)
+            print(f"{stats.get('error')}")
+            print("="*70)
+        
+        print()Also update the run() method to ensure stats is always returned:    def run(self) -> bool:
+        """
+        Execute data loading process
+        
+        Returns:
+            True if successful
+        """
+        stats = None  # Initialize stats
+        
+        try:
+            logger.info("Starting Enterprise Data Loader")
+            logger.info(f"Input file: {self.config.file.input_file}")
+            
+            # Validate file exists
+            if not Path(self.config.file.input_file).exists():
+                logger.error(f"File not found: {self.config.file.input_file}")
+                stats = {
+                    'success': False,
+                    'error': f"File not found: {self.config.file.input_file}",
+                    'total_rows': 0,
+                    'failed_rows': 0
+                }
+                self._print_statistics(stats)
+                return False
+            
+            # Initialize connection pool
+            self._initialize_connection_pool()
+            
+            # Get parser
+            parser = self._get_parser()
+            
+            # Validate file
+            if self.config.file.validate_schema:
+                if not parser.validate():
+                    logger.error("File validation failed")
+                    stats = {
+                        'success': False,
+                        'error': 'File validation failed',
+                        'total_rows': 0,
+                        'failed_rows': 0
+                    }
+                    self._print_statistics(stats)
+                    return False
+            
+            # Initialize loader
+            loader = DataLoader(
+                pool=self.pool,
+                table_name=self.config.loader.staging_table,
+                chunk_size=self.config.loader.chunk_size,
+                max_workers=self.config.loader.max_workers,
+                batch_errors=self.config.loader.batch_errors,
+                error_output_dir='failed_data',
+                atomic_load=True  # Enable atomic all-or-nothing loading
+            )
+            
+            # Load data
+            stats = loader.load_from_generator(
+                data_generator=parser.parse(),
+                create_table=self.config.loader.create_table,
+                drop_if_exists=self.config.loader.drop_if_exists
+            )
+            
+            # Print results
+            self._print_statistics(stats)
+            
+            return stats.get('success', False) if stats else False
+            
+        except Exception as e:
+            logger.error(f"Application failed: {str(e)}", exc_info=True)
+            
+            # Create error stats if not already created
+            if stats is None:
+                stats = {
+                    'success': False,
+                    'error': str(e),
+                    'total_rows': 0,
+                    'failed_rows': 0
+                }
+            
+            self._print_statistics(stats)
+            return False
+        
+        finally:
+            if self.pool:
+                self.pool.close()
+            logger.info("Application finished")Key Changes:Safe .get() calls: All stats.get() calls now have default valuesNone check: Added check at start of _print_statistics() to handle None statsNested dict safety: Check if first_failure exists before accessing itInitialize stats: Set stats = None at start of run() methodError handling: Create default stats dict on exceptionsThis prevents the AttributeError when stats is None .
