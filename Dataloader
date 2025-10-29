@@ -1,0 +1,250 @@
+"""
+Multithreaded data loader for Oracle database
+"""
+
+import pandas as pd
+import oracledb
+import time
+from typing import List, Dict, Any, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from database.connection_pool import OracleConnectionPool
+from utils.logger import LoggerFactory
+from utils.validators import DataValidator
+
+
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataLoader:
+    """Enterprise data loader with multithreading support"""
+    
+    def __init__(self, pool: OracleConnectionPool, table_name: str,
+                 chunk_size: int = 10000, max_workers: int = 4,
+                 batch_errors: bool = False):
+        """
+        Initialize data loader
+        
+        Args:
+            pool: Oracle connection pool
+            table_name: Target table name
+            chunk_size: Rows per chunk
+            max_workers: Number of parallel threads
+            batch_errors: Enable batch error handling
+        """
+        self.pool = pool
+        self.table_name = table_name
+        self.chunk_size = chunk_size
+        self.max_workers = max_workers
+        self.batch_errors = batch_errors
+        self.stats_lock = Lock()
+        self.total_rows = 0
+        self.failed_rows = 0
+    
+    def _prepare_insert_statement(self, columns: List[str]) -> str:
+        """Generate parameterized INSERT statement"""
+        cols = ', '.join(columns)
+        placeholders = ', '.join([f':{i+1}' for i in range(len(columns))])
+        return f"INSERT INTO {self.table_name} ({cols}) VALUES ({placeholders})"
+    
+    def _load_chunk(self, chunk_data: pd.DataFrame, chunk_id: int) -> Dict[str, Any]:
+        """
+        Load a single chunk into Oracle
+        
+        Args:
+            chunk_data: DataFrame chunk to load
+            chunk_id: Chunk identifier
+            
+        Returns:
+            Dictionary with load statistics
+        """
+        start_time = time.time()
+        rows_inserted = 0
+        rows_failed = 0
+        total_rows_in_chunk = len(chunk_data)
+        
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.setinputsizes(None, self.chunk_size)
+                
+                columns = chunk_data.columns.tolist()
+                insert_sql = self._prepare_insert_statement(columns)
+                
+                # Handle NaN/None values
+                chunk_data = chunk_data.where(pd.notnull(chunk_data), None)
+                data_tuples = [tuple(row) for row in chunk_data.values]
+                
+                # Batch insert
+                if self.batch_errors:
+                    cursor.executemany(insert_sql, data_tuples, batcherrors=True)
+                    errors = cursor.getbatcherrors()
+                    if errors:
+                        rows_failed = len(errors)
+                        rows_inserted = len(data_tuples) - len(errors)
+                        logger.warning(f"Chunk {chunk_id}: {rows_failed} row errors out of {total_rows_in_chunk}")
+                        for err in errors[:5]:  # Log first 5 errors
+                            logger.error(f"  Row error: {err.message}")
+                    else:
+                        rows_inserted = len(data_tuples)
+                else:
+                    cursor.executemany(insert_sql, data_tuples)
+                    rows_inserted = len(data_tuples)
+                
+                conn.commit()
+                cursor.close()
+            
+            elapsed = time.time() - start_time
+            throughput = rows_inserted / elapsed if elapsed > 0 else 0
+            
+            logger.info(
+                f"Chunk {chunk_id}: {rows_inserted} inserted, {rows_failed} failed "
+                f"in {elapsed:.2f}s ({throughput:.0f} rows/sec)"
+            )
+            
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': rows_inserted,
+                'rows_failed': rows_failed,
+                'total_rows': total_rows_in_chunk,
+                'success': True,
+                'elapsed': elapsed
+            }
+            
+        except Exception as e:
+            # Complete chunk failure
+            logger.error(f"Chunk {chunk_id} COMPLETELY FAILED: {str(e)}")
+            return {
+                'chunk_id': chunk_id,
+                'rows_inserted': 0,
+                'rows_failed': total_rows_in_chunk,  # All rows failed
+                'total_rows': total_rows_in_chunk,
+                'success': False,
+                'error': str(e)
+            }
+    
+    def create_table_from_dataframe(self, sample_df: pd.DataFrame, 
+                                   drop_if_exists: bool = True):
+        """
+        Create staging table from DataFrame schema
+        
+        Args:
+            sample_df: Sample DataFrame for schema inference
+            drop_if_exists: Drop table if it already exists
+        """
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Drop existing table
+                if drop_if_exists:
+                    try:
+                        cursor.execute(f"DROP TABLE {self.table_name} PURGE")
+                        logger.info(f"Dropped existing table: {self.table_name}")
+                    except oracledb.DatabaseError:
+                        pass
+                
+                # Map pandas dtypes to Oracle types
+                type_mapping = {
+                    'int64': 'NUMBER',
+                    'int32': 'NUMBER',
+                    'float64': 'NUMBER',
+                    'float32': 'NUMBER',
+                    'object': 'VARCHAR2(4000)',
+                    'bool': 'NUMBER(1)',
+                    'datetime64[ns]': 'TIMESTAMP',
+                    'datetime64': 'TIMESTAMP'
+                }
+                
+                # Build column definitions
+                columns_def = []
+                for col, dtype in sample_df.dtypes.items():
+                    clean_col = col.replace(' ', '_').replace('-', '_').upper()
+                    oracle_type = type_mapping.get(str(dtype), 'VARCHAR2(4000)')
+                    columns_def.append(f"{clean_col} {oracle_type}")
+                
+                # Create table
+                create_sql = f"CREATE TABLE {self.table_name} ({', '.join(columns_def)})"
+                cursor.execute(create_sql)
+                conn.commit()
+                
+                logger.info(f"Created table: {self.table_name}")
+                logger.info(f"Columns: {', '.join([cd.split()[0] for cd in columns_def])}")
+                cursor.close()
+                
+        except Exception as e:
+            logger.error(f"Failed to create table: {str(e)}")
+            raise
+    
+    def load_from_generator(self, data_generator: Generator[pd.DataFrame, None, None],
+                           create_table: bool = True, drop_if_exists: bool = True) -> Dict[str, Any]:
+        """
+        Load data from a generator that yields DataFrames
+        
+        Args:
+            data_generator: Generator yielding DataFrame chunks
+            create_table: Auto-create table from first chunk
+            drop_if_exists: Drop existing table before creation
+            
+        Returns:
+            Dictionary with load statistics
+        """
+        overall_start = time.time()
+        
+        # Get first chunk
+        try:
+            first_chunk = next(data_generator)
+        except StopIteration:
+            logger.error("No data to load")
+            return {'success': False, 'error': 'No data found', 'total_rows': 0, 'failed_rows': 0}
+        
+        # Validate first chunk
+        is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)
+        if not is_valid:
+            logger.error(f"Data validation failed: {error_msg}")
+            return {'success': False, 'error': error_msg, 'total_rows': 0, 'failed_rows': 0}
+        
+        # Create table if needed
+        if create_table:
+            self.create_table_from_dataframe(first_chunk, drop_if_exists)
+        
+        # Process chunks with multithreading
+        chunk_id = 0
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit first chunk
+            futures.append(executor.submit(self._load_chunk, first_chunk, chunk_id))
+            chunk_id += 1
+            
+            # Submit remaining chunks
+            for chunk in data_generator:
+                futures.append(executor.submit(self._load_chunk, chunk, chunk_id))
+                chunk_id += 1
+            
+            # Collect results - FIXED LOGIC
+            for future in as_completed(futures):
+                result = future.result()
+                with self.stats_lock:
+                    # Always accumulate inserted and failed rows
+                    self.total_rows += result.get('rows_inserted', 0)
+                    self.failed_rows += result.get('rows_failed', 0)
+        
+        overall_elapsed = time.time() - overall_start
+        total_processed = self.total_rows + self.failed_rows
+        
+        return {
+            'total_rows': self.total_rows,
+            'failed_rows': self.failed_rows,
+            'total_processed': total_processed,
+            'total_chunks': chunk_id,
+            'elapsed_seconds': overall_elapsed,
+            'rows_per_second': total_processed / overall_elapsed if overall_elapsed > 0 else 0,
+            'success': self.failed_rows == 0  # Success only if no failures
+        }
