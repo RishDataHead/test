@@ -1,0 +1,99 @@
+Looking at your log screenshot, I can see the issue. The problem is with the logging sequence and thread completion order. Here's what's happening:The ProblemChunk 2 processed successfully (2,236 rows inserted at 19:43:04.742)But it shows under "Cancelling remaining pending chunks..." sectionThis is because chunk 5 failed (triggering atomic rollback at 19:43:04.976)The logging message "Cancelling remaining pending chunks..." is printed AFTER some chunks already completedRoot CauseThe issue is in the load_from_generator() method. The "Cancelling remaining pending chunks..." message is logged when collecting results, but by that time some threads have already finished and logged their success messages.Fix for enterprise_data_loader/loaders/data_loader.pyReplace the results collection section in load_from_generator():Find this section (around line 380-410):            # Collect results
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                
+                logger.debug(f"Chunk {result['chunk_id']} completed ({completed}/{len(futures)})")
+                
+                with self.stats_lock:
+                    if not result.get('skipped', False):
+                        self.total_rows += result.get('rows_inserted', 0)
+                        self.failed_rows += result.get('rows_failed', 0)
+                        
+                        if result.get('rows_failed', 0) > 0:
+                            failed_chunk_info = {
+                                'chunk_id': result['chunk_id'],
+                                'rows_failed': result['rows_failed'],
+                                'total_rows': result['total_rows'],
+                                'error_message': result.get('error_message', 'Unknown error')
+                            }
+                            self.failed_chunks.append(failed_chunk_info)
+                
+                # In atomic mode, cancel remaining futures if failure detected
+                if self.atomic_load and self.failure_event.is_set():
+                    logger.warning("Cancelling remaining pending chunks...")
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                            logger.debug("Chunk cancelled")
+                    breakReplace with:            # Collect results
+            completed = 0
+            cancellation_logged = False
+            
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                
+                logger.debug(f"Chunk {result['chunk_id']} completed ({completed}/{len(futures)})")
+                
+                with self.stats_lock:
+                    if not result.get('skipped', False):
+                        self.total_rows += result.get('rows_inserted', 0)
+                        self.failed_rows += result.get('rows_failed', 0)
+                        
+                        if result.get('rows_failed', 0) > 0:
+                            failed_chunk_info = {
+                                'chunk_id': result['chunk_id'],
+                                'rows_failed': result['rows_failed'],
+                                'total_rows': result['total_rows'],
+                                'error_message': result.get('error_message', 'Unknown error')
+                            }
+                            self.failed_chunks.append(failed_chunk_info)
+                            
+                            # Log cancellation message immediately when first failure detected
+                            if self.atomic_load and not cancellation_logged:
+                                cancellation_logged = True
+                                pending_count = sum(1 for f in futures if not f.done())
+                                if pending_count > 0:
+                                    logger.warning(f"Failure detected - Cancelling {pending_count} remaining pending chunks...")
+                
+                # In atomic mode, cancel remaining futures if failure detected
+                if self.atomic_load and self.failure_event.is_set():
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                            logger.debug(f"Pending chunk cancelled")
+                    breakAlternative: Better Structured LoggingFor even clearer logging, add a summary section after all chunks complete:Add this after the executor block (around line 415):        logger.info("="*70)
+        logger.info("CHUNK PROCESSING SUMMARY")
+        logger.info("="*70)
+        
+        # Log successful chunks
+        successful_chunks = [i for i in range(chunk_id) 
+                           if i not in [fc['chunk_id'] for fc in self.failed_chunks]]
+        if successful_chunks:
+            logger.info(f"✓ Successfully processed chunks: {successful_chunks}")
+            logger.info(f"  Total successful chunks: {len(successful_chunks)}")
+        
+        # Log failed chunks
+        if self.failed_chunks:
+            failed_ids = [fc['chunk_id'] for fc in self.failed_chunks]
+            logger.error(f"✗ Failed chunks: {failed_ids}")
+            logger.error(f"  Total failed chunks: {len(failed_ids)}")
+        
+        # Log skipped chunks (in atomic mode)
+        if self.atomic_load and self.failure_event.is_set():
+            all_chunk_ids = set(range(chunk_id))
+            processed_ids = set(successful_chunks + [fc['chunk_id'] for fc in self.failed_chunks])
+            skipped_ids = sorted(all_chunk_ids - processed_ids)
+            if skipped_ids:
+                logger.warning(f"⊘ Skipped chunks (due to atomic rollback): {skipped_ids}")
+                logger.warning(f"  Total skipped chunks: {len(skipped_ids)}")
+        
+        logger.info("="*70)What These Changes DoImmediate cancellation logging: Logs "Cancelling..." message right when the first failure is detected, not after other chunks complete.Pending count: Shows exactly how many chunks are being cancelled.Summary section: Clearly separates successful, failed, and skipped chunks at the end.Prevents confusion: Successful chunks won't appear under cancellation messages.With these changes, your logs will show:CHUNK 2 - ✓ SUCCESS
+  Rows inserted: 2,236
+  
+CHUNK 5 - ✗ COMPLETE FAILURE
+  Triggering atomic rollback
+  
+Failure detected - Cancelling 3 remaining pending chunks...This makes it crystal clear that Chunk 2 succeeded BEFORE the failure was detected �.
