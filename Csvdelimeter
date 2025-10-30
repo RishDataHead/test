@@ -1,0 +1,162 @@
+I'll add CSV delimiter configuration support. You need to modify THREE FILES �:File 1: enterprise_data_loader/config.pyAdd delimiter parameter to FileConfig:Find this section:@dataclass
+class FileConfig:
+    """File processing configuration"""
+    input_file: str = 'data.csv'
+    file_encoding: str = 'utf-8'
+    xml_record_tag: str = 'record'
+    xml_schema_file: Optional[str] = None
+    validate_schema: bool = TrueReplace with:@dataclass
+class FileConfig:
+    """File processing configuration"""
+    input_file: str = 'data.csv'
+    file_encoding: str = 'utf-8'
+    csv_delimiter: str = ','  # NEW: CSV delimiter (comma, pipe, tab, semicolon, etc.)
+    xml_record_tag: str = 'record'
+    xml_schema_file: Optional[str] = None
+    validate_schema: bool = TrueFile 2: enterprise_data_loader/parsers/csv_parser.pyAdd delimiter parameter to CSVParser:Find the __init__ method:class CSVParser(BaseParser):
+    """Parse CSV files efficiently"""
+    
+    def __init__(self, file_path: str, chunk_size: int = 10000, encoding: str = 'utf-8'):
+        """
+        Initialize CSV parser
+        
+        Args:
+            file_path: Path to CSV file
+            chunk_size: Number of rows per chunk
+            encoding: File encoding
+        """
+        super().__init__(file_path, chunk_size)
+        self.encoding = encodingReplace with:class CSVParser(BaseParser):
+    """Parse CSV files efficiently"""
+    
+    def __init__(self, file_path: str, chunk_size: int = 10000, 
+                 encoding: str = 'utf-8', delimiter: str = ','):
+        """
+        Initialize CSV parser
+        
+        Args:
+            file_path: Path to CSV file
+            chunk_size: Number of rows per chunk
+            encoding: File encoding
+            delimiter: CSV delimiter character (comma, pipe, tab, semicolon, etc.)
+        """
+        super().__init__(file_path, chunk_size)
+        self.encoding = encoding
+        self.delimiter = delimiter
+        
+        logger.info(f"CSV Parser initialized with delimiter: '{delimiter}'")Update the validate method:    def validate(self) -> bool:
+        """Validate CSV file structure"""
+        try:
+            # Read first few rows to validate
+            pd.read_csv(self.file_path, nrows=5, encoding=self.encoding, sep=self.delimiter)
+            logger.info(f"CSV file validation passed: {self.file_path}")
+            return True
+        except Exception as e:
+            logger.error(f"CSV validation failed: {str(e)}")
+            return FalseUpdate the parse method:    def parse(self) -> Generator[pd.DataFrame, None, None]:
+        """
+        Parse CSV file in chunks
+        
+        Yields:
+            DataFrame chunks
+        """
+        logger.info(f"Parsing CSV file: {self.file_path}")
+        logger.info(f"Delimiter: '{self.delimiter}', Encoding: {self.encoding}")
+        
+        try:
+            for chunk in pd.read_csv(
+                self.file_path, 
+                chunksize=self.chunk_size,
+                low_memory=False, 
+                encoding=self.encoding,
+                sep=self.delimiter  # Use configured delimiter
+            ):
+                yield chunk
+            
+            logger.info("CSV parsing complete")
+            
+        except Exception as e:
+            logger.error(f"CSV parsing error: {str(e)}")
+            raiseFile 3: enterprise_data_loader/main.pyUpdate the parser initialization to pass delimiter:Find the _get_parser method:    def _get_parser(self):
+        """
+        Get appropriate parser based on file type
+        
+        Returns:
+            Parser instance
+        """
+        file_path = self.config.file.input_file
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.csv':
+            return CSVParser(
+                file_path=file_path,
+                chunk_size=self.config.loader.chunk_size,
+                encoding=self.config.file.file_encoding
+            )Replace with:    def _get_parser(self):
+        """
+        Get appropriate parser based on file type
+        
+        Returns:
+            Parser instance
+        """
+        file_path = self.config.file.input_file
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.csv':
+            return CSVParser(
+                file_path=file_path,
+                chunk_size=self.config.loader.chunk_size,
+                encoding=self.config.file.file_encoding,
+                delimiter=self.config.file.csv_delimiter  # Pass delimiter
+            )Usage ExamplesNow you can configure different delimiters in main.py:def main():
+    """Main entry point"""
+    
+    config = AppConfig.from_env()
+    
+    # Database settings
+    config.database.user = 'your_username'
+    config.database.password = 'your_password'
+    config.database.dsn = 'localhost:1521/XEPDB1'
+    
+    # File settings
+    config.file.input_file = 'data.csv'
+    config.file.file_encoding = 'utf-8'
+    
+    # ⭐ NEW: Configure CSV delimiter ⭐
+    config.file.csv_delimiter = ','     # Comma (default)
+    # config.file.csv_delimiter = '|'   # Pipe-delimited
+    # config.file.csv_delimiter = '\t'  # Tab-delimited
+    # config.file.csv_delimiter = ';'   # Semicolon-delimited
+    
+    # Loader settings
+    config.loader.staging_table = 'STG_DATA_LOAD'
+    config.loader.chunk_size = 10000
+    config.loader.max_workers = 4
+    config.loader.batch_errors = True
+    
+    app = DataLoaderApp(config)
+    success = app.run()
+    
+    sys.exit(0 if success else 1)Common Delimiter Examples# Comma-separated (standard CSV)
+config.file.csv_delimiter = ','
+# File: data.csv
+# id,name,age
+# 1,John,30
+
+# Pipe-delimited
+config.file.csv_delimiter = '|'
+# File: data.psv
+# id|name|age
+# 1|John|30
+
+# Tab-delimited (TSV)
+config.file.csv_delimiter = '\t'
+# File: data.tsv
+# id    name    age
+# 1     John    30
+
+# Semicolon-delimited (European CSV)
+config.file.csv_delimiter = ';'
+# File: data.csv
+# id;name;age
+# 1;John;30Now your data loader supports any CSV delimiter! �
