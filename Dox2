@@ -1,0 +1,205 @@
+Continuing the documentation �:6. parsers/csv_parser.py - CSV File Parser (Continued)What It Does:class CSVParser(BaseParser):
+    """Parse CSV files efficiently"""
+    
+    def __init__(self, file_path: str, chunk_size: int = 10000, 
+                 encoding: str = 'utf-8', delimiter: str = ','):
+        super().__init__(file_path, chunk_size)
+        self.encoding = encoding
+        self.delimiter = delimiterKey Components:init()Why: Configure CSV-specific settingsWhat: Stores encoding and delimiterParameters:file_path: Path to CSV filechunk_size: Rows per chunk (default 10,000)encoding: Character encoding (UTF-8, Latin-1, etc.)delimiter: Column separator (,, |, \t, ;)How: Passes base parameters to parent classvalidate()Why: Catch file issues before processing millions of rowsWhat: Reads first 5 rows to test file formatHow: Uses pd.read_csv(nrows=5) with configured delimiterDetects:Missing fileWrong encoding (garbled characters)Wrong delimiter (only 1 column parsed)Corrupt file structureparse()Why: Memory-efficient processing of large filesWhat: Yields DataFrame chunks via generatorHow: Uses pd.read_csv(chunksize=...) which returns iteratorMemory Usage: Only chunk_size rows in memory at onceExample:# 1M row file with chunk_size=10,000
+# Only 10K rows loaded at a time
+# 100 chunks yielded sequentiallyDesign Decisions:Generator pattern: Memory-efficient for files larger than RAMConfigurable delimiter: Supports CSV, TSV, PSV, semicolon-delimitedEncoding parameter: Handles international charactersEarly validation: 5 rows is enough to detect issueslow_memory=False: Properly infers data types (slightly slower but safer)Supported Delimiters:','   # Standard CSV (Comma-Separated Values)
+'|'   # PSV (Pipe-Separated Values)
+'\t'  # TSV (Tab-Separated Values)
+';'   # European CSV (semicolon for countries using comma as decimal)7. parsers/xml_parser.py - XML File ParserPurpose: Parse XML files with schema validation and memory-efficient iterationWhy It Exists:XML is common in enterprise data exchangesLarge XML files require streaming parsingSchema validation ensures data qualityDifferent XML structures require configurable record tagsWhat It Does:class XMLParser(BaseParser):
+    """Parse and validate XML files"""
+    
+    def __init__(self, file_path: str, record_tag: str, 
+                 chunk_size: int = 10000, schema_file: Optional[str] = None):
+        super().__init__(file_path, chunk_size)
+        self.record_tag = record_tag      # e.g., "employee", "transaction"
+        self.schema_file = schema_file    # Optional XSD for validationKey Components:init()Why: XML requires knowing which elements are recordsWhat: Stores record tag and optional schemaParameters:record_tag: XML element name representing one recordschema_file: Optional XSD file for validationExample:<employees>
+    <employee>...</employee>  <!-- record_tag = "employee" -->
+    <employee>...</employee>
+</employees>validate()Why: XML schema violations should fail before processingWhat: Validates entire XML against XSD schemaHow: Uses lxml.etree.XMLSchema to validate structureChecks:Well-formed XML syntaxSchema compliance (required fields, data types)Element nesting structureLogs: First few validation errors with line numbersparse()Why: Memory-efficient XML processingWhat: Iteratively extracts records, yields DataFrame chunksHow:Uses ET.iterparse() for streamingExtracts child elements from each recordClears processed elements to free memoryAccumulates records until chunk size reachedMemory Management:elem.clear()  # Crucial! Prevents memory leakXML Structure Example:<?xml version="1.0"?>
+<data>
+    <record>
+        <id>1</id>
+        <name>John Doe</name>
+        <age>30</age>
+    </record>
+    <record>
+        <id>2</id>
+        <name>Jane Smith</name>
+        <age>25</age>
+    </record>
+</data>Design Decisions:iterparse vs parse: Memory-efficient for large filesElement clearing: Prevents memory buildupOptional schema: Validation is opt-in (performance vs safety)Child text extraction: Simple flat XML to DataFrame conversion8. loaders/data_loader.py - Core Loading EnginePurpose: Load DataFrame chunks into Oracle with atomic transaction supportWhy It Exists:Core business logic of the applicationHandles data integrity (atomic rollback)Manages parallel/sequential chunk processingCreates tables automaticallyTracks failures and provides detailed loggingWhat It Does:class DataLoader:
+    """Enterprise data loader with atomic all-or-nothing loading"""
+    
+    def __init__(self, pool, table_name, chunk_size=10000, 
+                 max_workers=4, batch_errors=False, atomic_load=True):Key Components:1. init() - InitializationWhy: Configure loader behavior and trackingWhat: Sets up connection pool, table name, threading, error handlingParameters:pool: OracleConnectionPool instancetable_name: Target Oracle tablechunk_size: Rows per INSERT batchmax_workers: Thread count (unused in atomic mode)batch_errors: Continue on row-level errors?atomic_load: Enable all-or-nothing modeState Variables:total_rows, failed_rows: Statisticsfailed_chunks: List of failed chunk detailsfailure_event: Thread-safe Event for signaling failuresfirst_failure_info: First failure details for rollback reporting2. _prepare_insert_statement() - SQL GenerationWhy: Generate parameterized SQL for safety and performanceWhat: Creates INSERT with bind variablesHow: INSERT INTO table (col1, col2) VALUES (:1, :2)Security: Parameterized queries prevent SQL injection3. _truncate_table() - Rollback Mechanismdef _truncate_table(self):
+    """Remove all data from table on failure"""
+    cursor.execute(f"TRUNCATE TABLE {self.table_name}")Why: Atomic rollback requires removing partial dataWhat: Deletes all rows from tableHow: Uses TRUNCATE (faster than DELETE)Fallback: Tries DELETE if TRUNCATE failsDesign: TRUNCATE is DDL (can't be rolled back), but that's OK - we want permanent removal4. _log_chunk_failure_details() - Error Loggingdef _log_chunk_failure_details(self, chunk_id, chunk_data, error_message, batch_errors=None):
+    """Log comprehensive failure information"""Why: Debugging requires seeing actual data that failedWhat Logs:Chunk ID and total rowsError messageFirst 10 row-level errors (if batch errors)First 5 rows of actual dataValue: Helps identify data quality issues without CSV export5. _process_result() - Statistics Aggregationdef _process_result(self, result):
+    """Update statistics from chunk result"""
+    with self.stats_lock:  # Thread-safe
+        self.total_rows += result['rows_inserted']
+        self.failed_rows += result['rows_failed']
+        if result['rows_failed'] > 0:
+            self.failed_chunks.append(...)Why: Centralized statistics trackingWhat: Accumulates success/failure countsThread Safety: Uses Lock to prevent race conditionsTracks: Total rows, failed rows, failed chunk details6. _load_chunk() - Core Loading Logicdef _load_chunk(self, chunk_data, chunk_id):
+    """Load one chunk into database"""Step-by-step Process:Check failure eventif self.atomic_load and self.failure_event.is_set():
+    return {'skipped': True}Skip if another chunk already failedPrevents wasted work in atomic modeAcquire database connectionwith self.pool.get_connection() as conn:Gets connection from poolAuto-releases on exitPrepare datachunk_data_clean = chunk_data.where(pd.notnull(chunk_data), None)
+data_tuples = [tuple(row) for row in chunk_data_clean.values]Replace NaN with None (Oracle NULL)Convert DataFrame to list of tuplesExecute batch insertif self.batch_errors:
+    cursor.executemany(insert_sql, data_tuples, batcherrors=True)
+    errors = cursor.getbatcherrors()
+else:
+    cursor.executemany(insert_sql, data_tuples)executemany: Batch operation (faster than individual INSERTs)batcherrors=True: Continue on row-level errorsCollect errors if anyHandle failuresif errors:
+    self.failure_event.set()  # Signal other threads
+    self._log_chunk_failure_details(...)Set failure flag for atomic modeLog detailed error informationCommit transactionconn.commit()Persist changes to databaseReturn statisticsreturn {
+    'chunk_id': chunk_id,
+    'rows_inserted': rows_inserted,
+    'rows_failed': rows_failed,
+    'success': rows_failed == 0,
+    'elapsed': elapsed_time
+}Design Decisions:Per-chunk transactions: Each chunk commits independentlyBatch errors flag: Configurable strictnessDetailed logging: Every chunk logs progressThread naming: Logs show which thread processed which chunk7. create_table_from_dataframe() - Auto Table Creationdef create_table_from_dataframe(self, sample_df, drop_if_exists=True):
+    """Auto-create Oracle table from DataFrame schema"""Process:Drop existing table (optional)cursor.execute(f"DROP TABLE {self.table_name} PURGE")PURGE = don't keep in recycle binMap pandas dtypes to Oracle typestype_mapping = {
+    'int64': 'NUMBER',
+    'float64': 'NUMBER',
+    'object': 'VARCHAR2(4000)',
+    'datetime64[ns]': 'TIMESTAMP'
+}Why these mappings:NUMBER: Universal Oracle numeric typeVARCHAR2(4000): Max non-LOB string sizeTIMESTAMP: Preserves date + timeGenerate CREATE TABLE SQLcolumns_def = []
+for col, dtype in sample_df.dtypes.items():
+    clean_col = col.replace(' ', '_').replace('-', '_').upper()
+    oracle_type = type_mapping.get(str(dtype), 'VARCHAR2(4000)')
+    columns_def.append(f"{clean_col} {oracle_type}")Sanitizes column names (Oracle rules)Defaults unknown types to VARCHAR2Execute CREATEcreate_sql = f"CREATE TABLE {table_name} ({', '.join(columns_def)})"
+cursor.execute(create_sql)Design Decisions:Infer from data: No manual DDL neededSafe defaults: VARCHAR2(4000) for unknown typesOracle conventions: Uppercase, underscoresLogged details: Shows exact CREATE statement in logs8. load_from_generator() - Main Orchestrationdef load_from_generator(self, data_generator, create_table=True, drop_if_exists=True):
+    """Orchestrate entire load process"""Process Flow:Get and validate first chunkfirst_chunk = next(data_generator)
+is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)First chunk provides schemaValidation catches issues earlyCreate table (if requested)if create_table:
+    self.create_table_from_dataframe(first_chunk, drop_if_exists)Process chunks (ATOMIC MODE - Sequential)if self.atomic_load:
+    # Process first chunk
+    result = self._load_chunk(first_chunk, 0)
+    self._process_result(result)
+
+    if result['rows_failed'] > 0:
+        # Stop immediately on first failure
+    else:
+        # Process remaining chunks one-by-one
+        for chunk in data_generator:
+            if self.failure_event.is_set():
+                break  # Another chunk failed
+
+            result = self._load_chunk(chunk, chunk_id)
+            self._process_result(result)
+
+            if result['rows_failed'] > 0:
+                break  # This chunk failedWhy Sequential in Atomic Mode:Detect failures immediatelyStop processing as soon as error occursNo wasted work on chunks that will be rolled backClean, ordered logsAtomic Rollback (if any failure)if self.atomic_load and self.failed_rows > 0:
+    logger.critical("ATOMIC LOAD FAILED - Truncating table")
+    self._truncate_table()
+    self.total_rows = 0  # Reset to 0 since table is emptyRemoves ALL data (even successful chunks)Ensures consistent stateLogs which chunk caused rollbackReturn comprehensive statisticsreturn {
+    'total_rows': self.total_rows,         # 0 if rolled back
+    'failed_rows': self.failed_rows,
+    'total_processed': total_attempted,
+    'success': self.failed_rows == 0,
+    'atomic_rollback': was_truncated,
+    'failed_chunks': self.failed_chunks,
+    'first_failure': self.first_failure_info
+}Design Decisions:Sequential in atomic mode: Prevents race conditions and wasted workParallel available: Non-atomic mode uses ThreadPoolExecutor (faster)Clear rollback logging: Shows exactly what failed and whyComplete statistics: Everything needed for debugging/reporting9. main.py - Application Entry PointPurpose: Orchestrate all components and provide user interfaceWhy It Exists:Entry point for executionWires together all modulesHandles configurationProvides user-friendly outputManages application lifecycleWhat It Does:class DataLoaderApp:
+    """Main application orchestrator"""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.pool = NoneKey Components:1. _initialize_connection_pool()def _initialize_connection_pool(self):
+    """Create database connection pool from config"""
+    self.pool = OracleConnectionPool(
+        user=self.config.database.user,
+        password=self.config.database.password,
+        dsn=self.config.database.dsn,
+        min_conn=self.config.database.min_pool_conn,
+        max_conn=self.config.database.max_pool_conn
+    )Why: Centralized pool creationWhat: Reads from config, creates poolDesign: Lazy initialization (only when needed)2. _get_parser() - Parser Factorydef _get_parser(self):
+    """Get appropriate parser based on file extension"""
+    file_ext = Path(self.config.file.input_file).suffix.lower()
+    
+    if file_ext == '.csv':
+        return CSVParser(...)
+    elif file_ext == '.xml':
+        return XMLParser(...)
+    else:
+        raise ValueError(f"Unsupported file type: {file_ext}")Why: Automatic format detectionWhat: Returns correct parser based on extensionExtensibility: Easy to add .json, .parquet, etc.3. _print_statistics() - User Outputdef _print_statistics(self, stats):
+    """Print user-friendly load results"""
+    print("="*70)
+    print("LOAD STATISTICS")
+    print(f"Total Rows Loaded: {stats['total_rows']:,}")
+    print(f"Failed Rows: {stats['failed_rows']:,}")
+    
+    if stats.get('atomic_rollback'):
+        print("⚠️  ATOMIC ROLLBACK EXECUTED")
+        print("Final Status: ❌ ALL DATA TRUNCATED")
+    
+    if stats.get('failed_chunks'):
+        print("
+FAILED CHUNKS:")
+        for fc in stats['failed_chunks']:
+            print(f"  Chunk {fc['chunk_id']}: {fc['error_message']}")Why: Users need clear feedbackWhat: Formats statistics for readabilityDesign: Separates successful vs failed scenarios4. run() - Main Execution Methoddef run(self):
+    """Execute data loading workflow"""
+    try:
+        # 1. Validate file exists
+        if not Path(self.config.file.input_file).exists():
+            logger.error("File not found")
+            return False
+        
+        # 2. Initialize connection pool
+        self._initialize_connection_pool()
+        
+        # 3. Get parser
+        parser = self._get_parser()
+        
+        # 4. Validate file
+        if not parser.validate():
+            logger.error("File validation failed")
+            return False
+        
+        # 5. Initialize loader
+        loader = DataLoader(...)
+        
+        # 6. Execute load
+        stats = loader.load_from_generator(
+            data_generator=parser.parse(),
+            create_table=self.config.loader.create_table,
+            drop_if_exists=self.config.loader.drop_if_exists
+        )
+        
+        # 7. Display results
+        self._print_statistics(stats)
+        
+        return stats['success']
+        
+    except Exception as e:
+        logger.error(f"Application failed: {str(e)}", exc_info=True)
+        return False
+    
+    finally:
+        if self.pool:
+            self.pool.close()Process Flow:File existence checkConnection pool creationParser selection and validationLoader initializationData loading executionResults displayCleanup (always runs via finally)Error Handling:Top-level try/except catches all errorsexc_info=True logs full stack traceReturns False on any failurefinally ensures pool cleanup5. main() - Program Entry Pointdef main():
+    """Main entry point"""
+    config = AppConfig.from_env()
+    
+    # Configure database
+    config.database.user = 'your_username'
+    config.database.password = 'your_password'
+    config.database.dsn = 'localhost:1521/XEPDB1'
+    
+    # Configure file
+    config.file.input_file = 'data.csv'
+    config.file.csv_delimiter = ','
+    
+    # Configure loader
+    config.loader.staging_table = 'STG_DATA_LOAD'
+    config.loader.chunk_size = 10000
+    config.loader.batch_errors = True
+    
+    # Run application
+    app = DataLoaderApp(config)
+    success = app.run()
+    
+    # Exit with appropriate code
+    sys.exit(0 if success else 1)Design Decisions:Exit codes: 0=success, 1=failure (Unix convention)Configuration first: All settings in one placeEnvironment variable support: Production-readyBoolean return: Simple success/failure indicatorKey Features Summary1. Atomic Transaction SupportWhat: All-or-nothing loadingWhy: Data integrity - no partial loadsHow: Sequential processing + TRUNCATE on failure2. Chunk-based ProcessingWhat: Process files in configurable chunksWhy: Memory efficiency for large filesHow: Generators yield DataFrames of chunk_size rows3. Automatic Table CreationWhat: Infer schema from file, create Oracle tableWhy: No manual DDL neededHow: pandas dtype → Oracle type mapping4. Configurable DelimitersWhat: Support CSV, TSV, PSV, semicolon-delimitedWhy: Different data sources use different formatsHow: csv_delimiter configuration parameter5. Detailed LoggingWhat: Log every operation with timestamps, thread namesWhy: Debugging production issuesHow: Centralized LoggerFactory with file + console output6. Connection PoolingWhat: Reusable database connectionsWhy: Performance (avoid connection overhead)How: oracledb connection pool with min/max limits7. Failed Chunk TrackingWhat: Track which chunks failed and whyWhy: Targeted troubleshootingHow: failed_chunks list with chunk ID, error, row counts8. Batch Error HandlingWhat: Continue loading even with row-level errorsWhy: Don't fail entire file for few bad rowsHow: executemany(..., batcherrors=True)This is a production-grade, enterprise-ready data loading solution designed for reliability, performance, and maintainability �!
