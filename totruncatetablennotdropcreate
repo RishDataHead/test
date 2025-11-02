@@ -1,0 +1,483 @@
+Perfect! You want to use existing tables and just truncate before loading. You need to modify **TWO FILES**:[1]
+
+***
+
+## File 1: `enterprise_data_loader/loaders/data_loader.py`
+
+### Changes Needed:
+
+1. **Add `truncate_before_load` parameter** to `__init__`
+2. **Add `_truncate_before_load()` method** (different from rollback truncate)
+3. **Remove/skip table creation logic** in `load_from_generator()`
+4. **Add truncate call** at start of load
+
+### Modified Sections:
+
+#### Change 1: Update `__init__` method
+
+**Find this (around line 30-50):**
+```python
+def __init__(self, pool, table_name, chunk_size=10000, 
+             max_workers=4, batch_errors=False, atomic_load=True):
+    """
+    Initialize data loader
+    
+    Args:
+        pool: Oracle connection pool
+        table_name: Target table name
+        chunk_size: Rows per chunk
+        max_workers: Number of parallel threads
+        batch_errors: Enable batch error handling
+        atomic_load: If True, rollback all on any failure (all-or-nothing)
+    """
+```
+
+**Replace with:**
+```python
+def __init__(self, pool, table_name, chunk_size=10000, 
+             max_workers=4, batch_errors=False, atomic_load=True,
+             truncate_before_load=True):
+    """
+    Initialize data loader
+    
+    Args:
+        pool: Oracle connection pool
+        table_name: Target table name
+        chunk_size: Rows per chunk
+        max_workers: Number of parallel threads
+        batch_errors: Enable batch error handling
+        atomic_load: If True, rollback all on any failure (all-or-nothing)
+        truncate_before_load: If True, truncate table before loading
+    """
+    self.pool = pool
+    self.table_name = table_name
+    self.chunk_size = chunk_size
+    self.max_workers = max_workers
+    self.batch_errors = batch_errors
+    self.atomic_load = atomic_load
+    self.truncate_before_load = truncate_before_load  # NEW
+    
+    # Rest of __init__ remains the same...
+```
+
+#### Change 2: Add new method `_truncate_before_load()`
+
+**Add this method after `_truncate_table()` (around line 100):**
+
+```python
+def _truncate_before_load(self):
+    """Truncate table before loading (pre-load cleanup)"""
+    logger.info("="*70)
+    logger.info("PRE-LOAD TABLE TRUNCATION")
+    logger.info(f"Table: {self.table_name}")
+    logger.info("="*70)
+    
+    try:
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            truncate_sql = f"TRUNCATE TABLE {self.table_name}"
+            logger.info(f"Executing: {truncate_sql}")
+            cursor.execute(truncate_sql)
+            conn.commit()
+            cursor.close()
+            logger.info(f"✓ Table {self.table_name} truncated successfully")
+            logger.info("  Table is now empty and ready for loading")
+    except Exception as e:
+        logger.error(f"✗ TRUNCATE failed: {str(e)}")
+        logger.error("  Table must exist before loading!")
+        logger.error("  Please create table manually or enable create_table option")
+        raise
+    
+    logger.info("="*70)
+```
+
+#### Change 3: Modify `load_from_generator()` method
+
+**Find this section (around line 350-380):**
+```python
+def load_from_generator(self, data_generator, create_table=True, drop_if_exists=True):
+    """
+    Load data from a generator with atomic all-or-nothing guarantee
+    """
+    overall_start = time.time()
+    
+    # Reset state
+    self.failure_event.clear()
+    self.first_failure_info = None
+    self.total_rows = 0
+    self.failed_rows = 0
+    self.failed_chunks = []
+    
+    # Get first chunk
+    try:
+        logger.info("Reading first chunk...")
+        first_chunk = next(data_generator)
+        logger.info(f"✓ First chunk loaded: {len(first_chunk)} rows")
+    except StopIteration:
+        logger.error("✗ No data to load - file is empty")
+        return {
+            'success': False, 
+            'error': 'No data found', 
+            'total_rows': 0, 
+            'failed_rows': 0,
+            'failed_chunks': [],
+            'atomic_rollback': False
+        }
+    
+    # Validate first chunk
+    logger.info("Validating data...")
+    is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)
+    if not is_valid:
+        logger.error(f"✗ Data validation failed: {error_msg}")
+        return {
+            'success': False, 
+            'error': error_msg, 
+            'total_rows': 0, 
+            'failed_rows': 0,
+            'failed_chunks': [],
+            'atomic_rollback': False
+        }
+    logger.info("✓ Data validation passed")
+    
+    # Create table if needed
+    if create_table:
+        self.create_table_from_dataframe(first_chunk, drop_if_exists)
+```
+
+**Replace with:**
+```python
+def load_from_generator(self, data_generator, create_table=False, drop_if_exists=False):
+    """
+    Load data from a generator with atomic all-or-nothing guarantee
+    Assumes table already exists unless create_table=True
+    """
+    overall_start = time.time()
+    
+    # Reset state
+    self.failure_event.clear()
+    self.first_failure_info = None
+    self.total_rows = 0
+    self.failed_rows = 0
+    self.failed_chunks = []
+    
+    # Get first chunk
+    try:
+        logger.info("Reading first chunk...")
+        first_chunk = next(data_generator)
+        logger.info(f"✓ First chunk loaded: {len(first_chunk)} rows")
+    except StopIteration:
+        logger.error("✗ No data to load - file is empty")
+        return {
+            'success': False, 
+            'error': 'No data found', 
+            'total_rows': 0, 
+            'failed_rows': 0,
+            'failed_chunks': [],
+            'atomic_rollback': False
+        }
+    
+    # Validate first chunk
+    logger.info("Validating data...")
+    is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)
+    if not is_valid:
+        logger.error(f"✗ Data validation failed: {error_msg}")
+        return {
+            'success': False, 
+            'error': error_msg, 
+            'total_rows': 0, 
+            'failed_rows': 0,
+            'failed_chunks': [],
+            'atomic_rollback': False
+        }
+    logger.info("✓ Data validation passed")
+    
+    # Create table if requested (usually False now)
+    if create_table:
+        logger.warning("create_table=True - Creating table from schema")
+        self.create_table_from_dataframe(first_chunk, drop_if_exists)
+    else:
+        logger.info("Using existing table (create_table=False)")
+        
+        # Truncate existing table before loading
+        if self.truncate_before_load:
+            try:
+                self._truncate_before_load()
+            except Exception as e:
+                logger.error(f"Failed to truncate table: {str(e)}")
+                return {
+                    'success': False,
+                    'error': f'Table truncation failed: {str(e)}',
+                    'total_rows': 0,
+                    'failed_rows': 0,
+                    'failed_chunks': [],
+                    'atomic_rollback': False
+                }
+```
+
+***
+
+## File 2: `enterprise_data_loader/main.py`
+
+### Changes Needed:
+
+1. **Update loader initialization** to use existing tables
+2. **Add command-line argument** for truncate option
+3. **Update defaults** for create_table and drop_if_exists
+
+### Modified Sections:
+
+#### Change 1: Update `run()` method
+
+**Find this section (around line 150-170):**
+```python
+# Initialize loader
+loader = DataLoader(
+    pool=self.pool,
+    table_name=self.config.loader.staging_table,
+    chunk_size=self.config.loader.chunk_size,
+    max_workers=self.config.loader.max_workers,
+    batch_errors=self.config.loader.batch_errors,
+    atomic_load=True
+)
+
+# Load data
+stats = loader.load_from_generator(
+    data_generator=parser.parse(),
+    create_table=self.config.loader.create_table,
+    drop_if_exists=self.config.loader.drop_if_exists
+)
+```
+
+**Replace with:**
+```python
+# Initialize loader
+loader = DataLoader(
+    pool=self.pool,
+    table_name=self.config.loader.staging_table,
+    chunk_size=self.config.loader.chunk_size,
+    max_workers=self.config.loader.max_workers,
+    batch_errors=self.config.loader.batch_errors,
+    atomic_load=True,
+    truncate_before_load=self.config.loader.truncate_before_load  # NEW
+)
+
+# Load data (defaults changed to False)
+stats = loader.load_from_generator(
+    data_generator=parser.parse(),
+    create_table=self.config.loader.create_table,      # Now defaults to False
+    drop_if_exists=self.config.loader.drop_if_exists   # Now defaults to False
+)
+```
+
+#### Change 2: Update command-line arguments
+
+**Find this section in `parse_arguments()` (around line 280-310):**
+```python
+loader_group.add_argument(
+    '--no-create-table',
+    action='store_true',
+    help='Do not auto-create table'
+)
+
+loader_group.add_argument(
+    '--no-drop',
+    action='store_true',
+    help='Do not drop existing table before creation'
+)
+```
+
+**Replace with:**
+```python
+loader_group.add_argument(
+    '--create-table',
+    action='store_true',
+    help='Auto-create table from file schema (default: use existing table)'
+)
+
+loader_group.add_argument(
+    '--drop-table',
+    action='store_true',
+    help='Drop table before creation (only with --create-table)'
+)
+
+loader_group.add_argument(
+    '--no-truncate',
+    action='store_true',
+    help='Do not truncate table before loading (default: truncate)'
+)
+```
+
+#### Change 3: Update `main()` function
+
+**Find this section (around line 330-350):**
+```python
+# Loader configuration
+config.loader.staging_table = args.table
+config.loader.chunk_size = args.chunk_size
+config.loader.batch_errors = args.batch_errors
+config.loader.create_table = not args.no_create_table
+config.loader.drop_if_exists = not args.no_drop
+```
+
+**Replace with:**
+```python
+# Loader configuration
+config.loader.staging_table = args.table
+config.loader.chunk_size = args.chunk_size
+config.loader.batch_errors = args.batch_errors
+config.loader.create_table = args.create_table              # Changed: default False
+config.loader.drop_if_exists = args.drop_table              # Changed: default False
+config.loader.truncate_before_load = not args.no_truncate   # NEW: default True
+```
+
+***
+
+## File 3: `enterprise_data_loader/config.py`
+
+### Add truncate_before_load to LoaderConfig
+
+**Find this section:**
+```python
+@dataclass
+class LoaderConfig:
+    """Loader configuration"""
+    staging_table: str = 'STG_DATA_LOAD'
+    chunk_size: int = 10000
+    max_workers: int = 4
+    batch_errors: bool = False
+    create_table: bool = True
+    drop_if_exists: bool = True
+```
+
+**Replace with:**
+```python
+@dataclass
+class LoaderConfig:
+    """Loader configuration"""
+    staging_table: str = 'STG_DATA_LOAD'
+    chunk_size: int = 10000
+    max_workers: int = 4
+    batch_errors: bool = False
+    create_table: bool = False              # Changed: default False
+    drop_if_exists: bool = False            # Changed: default False
+    truncate_before_load: bool = True       # NEW: default True
+```
+
+***
+
+## Updated Usage Examples
+
+### 1. Load into Existing Table (Default Behavior)
+
+```bash
+# Table must already exist in database
+# Table will be truncated before loading
+python main.py --file data.csv --table EXISTING_TABLE
+```
+
+**What happens**:
+1. ✓ Validates file
+2. ✓ Truncates `EXISTING_TABLE`
+3. ✓ Loads data
+4. ✓ On failure: Truncates again (atomic rollback)
+
+### 2. Load Without Truncating (Append Mode)
+
+```bash
+# Add data to existing data (no truncate)
+python main.py --file data.csv --table EXISTING_TABLE --no-truncate
+```
+
+**What happens**:
+1. ✓ Validates file
+2. ✗ No truncate (skipped)
+3. ✓ Loads data (appends to existing)
+4. ✓ On failure: Truncates (atomic rollback removes everything including pre-existing data)
+
+### 3. Create Table (Old Behavior)
+
+```bash
+# Create table from file schema
+python main.py --file data.csv --table NEW_TABLE --create-table
+```
+
+**What happens**:
+1. ✓ Validates file
+2. ✓ Creates `NEW_TABLE` from CSV schema
+3. ✓ Loads data
+4. ✓ On failure: Truncates table
+
+### 4. Create Table with Drop
+
+```bash
+# Drop existing table and recreate
+python main.py --file data.csv --table EXISTING_TABLE --create-table --drop-table
+```
+
+**What happens**:
+1. ✓ Validates file
+2. ✓ Drops `EXISTING_TABLE` if exists
+3. ✓ Creates `EXISTING_TABLE` from schema
+4. ✓ Loads data
+
+***
+
+## Summary of Changes
+
+| Aspect | Old Behavior | New Behavior |
+|--------|-------------|--------------|
+| **Default** | Create table from file | Use existing table |
+| **Before Load** | Drop + Create (if enabled) | Truncate existing |
+| **Table Creation** | Default ON | Default OFF |
+| **Drop Table** | Default ON (with create) | Default OFF |
+| **Truncate Before** | Not available | Default ON |
+
+***
+
+## Configuration Summary
+
+```python
+# DEFAULT BEHAVIOR (existing table)
+config.loader.create_table = False           # Don't create
+config.loader.drop_if_exists = False         # Don't drop
+config.loader.truncate_before_load = True    # DO truncate before load
+
+# ATOMIC ROLLBACK (on failure)
+# Still truncates table regardless of above settings
+```
+
+***
+
+## Error Handling
+
+**If table doesn't exist**:
+```
+ERROR - ✗ TRUNCATE failed: ORA-00942: table or view does not exist
+ERROR - Table must exist before loading!
+ERROR - Please create table manually or enable create_table option
+```
+
+**Solution**: Create table manually or use `--create-table` flag.
+
+***
+
+## Complete Flow (New Default)
+
+```
+1. Parse command-line arguments
+2. Validate file exists and is readable
+3. Check if table exists (via truncate attempt)
+4. ✓ TRUNCATE table (empty it)
+5. Load data in chunks
+6. If any failure:
+   → ✓ TRUNCATE table (atomic rollback)
+   → Result: 0 rows
+7. If success:
+   → Result: All rows loaded
+```
+
+***
+
+Now your loader is configured to work with **existing tables** and uses **TRUNCATE instead of DROP** by default ![1]
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/5992b391-f10b-45d0-81e4-fd50e4c4edbf/1000143971.jpg)
