@@ -1,0 +1,502 @@
+Perfect! I'll create a comprehensive design flow diagram for the original program:[1]
+
+***
+
+# Enterprise Data Loader - Original Design Flow
+
+## System Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         USER / EXECUTION                             │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │  python main.py                                              │  │
+│  │  (Hardcoded configuration in code)                           │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        MAIN.PY (Entry Point)                        │
+│                                                                      │
+│  main()                                                              │
+│  ├─ Create AppConfig (hardcoded values)                             │
+│  ├─ Set database credentials (in code)                              │
+│  ├─ Set file path (in code)                                         │
+│  ├─ Set table name (in code)                                        │
+│  └─ Create DataLoaderApp(config)                                    │
+│     └─ app.run()                                                     │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     DataLoaderApp.run()                             │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 1. INITIALIZATION PHASE                                     │    │
+│  │    ├─ Setup logging (LoggerFactory)                         │    │
+│  │    ├─ Validate file exists                                  │    │
+│  │    └─ Initialize connection pool                            │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 2. PARSER SELECTION PHASE                                   │    │
+│  │    ├─ Get file extension (.csv or .xml)                     │    │
+│  │    ├─ Create CSVParser or XMLParser                         │    │
+│  │    └─ Validate file format                                  │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 3. LOADER INITIALIZATION PHASE                              │    │
+│  │    Create DataLoader with:                                  │    │
+│  │    ├─ pool (connection pool)                                │    │
+│  │    ├─ table_name                                            │    │
+│  │    ├─ chunk_size = 10000                                    │    │
+│  │    ├─ max_workers = 4                                       │    │
+│  │    ├─ batch_errors = False                                  │    │
+│  │    └─ atomic_load = True                                    │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 4. DATA LOADING PHASE                                       │    │
+│  │    Call loader.load_from_generator()                        │    │
+│  │    ├─ create_table = True (DEFAULT)                         │    │
+│  │    └─ drop_if_exists = True (DEFAULT)                       │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 5. STATISTICS DISPLAY PHASE                                 │    │
+│  │    └─ Print results to console                              │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│               CONNECTION POOL (OracleConnectionPool)                │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ oracledb.create_pool()                                      │    │
+│  │ ├─ user, password, dsn                                      │    │
+│  │ ├─ min = 2 connections                                      │    │
+│  │ ├─ max = 10 connections                                     │    │
+│  │ ├─ threaded = True                                          │    │
+│  │ └─ getmode = WAIT                                           │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ Context Manager: get_connection()                           │    │
+│  │ ├─ Acquire connection from pool                             │    │
+│  │ ├─ Yield to caller                                          │    │
+│  │ └─ Release back to pool (always)                            │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    PARSER (CSV or XML)                              │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ CSVParser.parse() - Generator Pattern                       │    │
+│  │                                                              │    │
+│  │ pd.read_csv(file, chunksize=10000)                          │    │
+│  │     │                                                        │    │
+│  │     ├─ Chunk 0: DataFrame (10,000 rows)  ────────┐         │    │
+│  │     ├─ Chunk 1: DataFrame (10,000 rows)  ────────┤         │    │
+│  │     ├─ Chunk 2: DataFrame (10,000 rows)  ────────┤         │    │
+│  │     ├─ ...                                ────────┤         │    │
+│  │     └─ Chunk N: DataFrame (remaining)     ────────┘         │    │
+│  │                                              │               │    │
+│  │                                              │ Yields one    │    │
+│  │                                              │ at a time     │    │
+│  └──────────────────────────────────────────────┼───────────────┘    │
+└──────────────────────────────────────────────────┼───────────────────┘
+                                                   │
+                                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 DataLoader.load_from_generator()                    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ STEP 1: Get First Chunk                                     │    │
+│  │ ├─ first_chunk = next(generator)                            │    │
+│  │ └─ Validate DataFrame (not empty, no duplicate columns)     │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ STEP 2: CREATE TABLE (create_table=True, drop_if_exists=True)│  │
+│  │                                                              │    │
+│  │ create_table_from_dataframe(first_chunk)                    │    │
+│  │                                                              │    │
+│  │ 2.1: DROP EXISTING TABLE                                    │    │
+│  │      ├─ Try: DROP TABLE table_name PURGE                    │    │
+│  │      └─ If not exists: Ignore error                         │    │
+│  │                                                              │    │
+│  │ 2.2: MAP DTYPES TO ORACLE TYPES                             │    │
+│  │      ├─ int64 → NUMBER                                      │    │
+│  │      ├─ float64 → NUMBER                                    │    │
+│  │      ├─ object → VARCHAR2(4000)                             │    │
+│  │      └─ datetime64[ns] → TIMESTAMP                          │    │
+│  │                                                              │    │
+│  │ 2.3: SANITIZE COLUMN NAMES                                  │    │
+│  │      ├─ Replace spaces with underscores                     │    │
+│  │      ├─ Replace dashes with underscores                     │    │
+│  │      └─ Convert to UPPERCASE                                │    │
+│  │                                                              │    │
+│  │ 2.4: EXECUTE CREATE TABLE                                   │    │
+│  │      CREATE TABLE table_name (                              │    │
+│  │          COLUMN_1 NUMBER,                                   │    │
+│  │          COLUMN_2 VARCHAR2(4000),                           │    │
+│  │          ...                                                 │    │
+│  │      )                                                       │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ STEP 3: SEQUENTIAL CHUNK PROCESSING (Atomic Mode)           │    │
+│  │                                                              │    │
+│  │ chunk_id = 0                                                 │    │
+│  │                                                              │    │
+│  │ ┌──────────────────────────────────────────────────────┐   │    │
+│  │ │ Process First Chunk (chunk_id = 0)                    │   │    │
+│  │ │ result = _load_chunk(first_chunk, 0)                 │   │    │
+│  │ │ _process_result(result)                              │   │    │
+│  │ └──────────────────────────────────────────────────────┘   │    │
+│  │                                                              │    │
+│  │ if result has failures:                                      │    │
+│  │     └─ Stop immediately                                      │    │
+│  │                                                              │    │
+│  │ else:                                                        │    │
+│  │     ┌──────────────────────────────────────────────────┐   │    │
+│  │     │ For each remaining chunk from generator:         │   │    │
+│  │     │                                                   │   │    │
+│  │     │ if failure_event.is_set():                       │   │    │
+│  │     │     └─ Break (stop processing)                   │   │    │
+│  │     │                                                   │   │    │
+│  │     │ result = _load_chunk(chunk, chunk_id)            │   │    │
+│  │     │ _process_result(result)                          │   │    │
+│  │     │ chunk_id += 1                                    │   │    │
+│  │     │                                                   │   │    │
+│  │     │ if result has failures:                          │   │    │
+│  │     │     └─ Break (stop immediately)                  │   │    │
+│  │     └──────────────────────────────────────────────────┘   │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DataLoader._load_chunk()                         │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ CHUNK LOADING PROCESS                                       │    │
+│  │                                                              │    │
+│  │ Input: DataFrame chunk (e.g., 10,000 rows)                  │    │
+│  │                                                              │    │
+│  │ 1. Check Failure Event                                      │    │
+│  │    if failure_event.is_set():                               │    │
+│  │        └─ Return {skipped: True}                            │    │
+│  │                                                              │    │
+│  │ 2. Acquire Database Connection                              │    │
+│  │    with pool.get_connection() as conn:                      │    │
+│  │                                                              │    │
+│  │ 3. Prepare INSERT Statement                                 │    │
+│  │    INSERT INTO table (col1, col2, ...) VALUES (:1, :2, ...) │    │
+│  │                                                              │    │
+│  │ 4. Clean Data                                               │    │
+│  │    ├─ Replace NaN with None (Oracle NULL)                   │    │
+│  │    └─ Convert DataFrame to list of tuples                   │    │
+│  │                                                              │    │
+│  │ 5. Execute Batch Insert                                     │    │
+│  │    if batch_errors = False (DEFAULT):                       │    │
+│  │        cursor.executemany(sql, data)                        │    │
+│  │        └─ Any error fails entire chunk                      │    │
+│  │                                                              │    │
+│  │    if batch_errors = True:                                  │    │
+│  │        cursor.executemany(sql, data, batcherrors=True)      │    │
+│  │        errors = cursor.getbatcherrors()                     │    │
+│  │        └─ Row-level errors logged, chunk continues          │    │
+│  │                                                              │    │
+│  │ 6. Handle Errors                                            │    │
+│  │    if errors found:                                         │    │
+│  │        ├─ Set failure_event (stop other chunks)             │    │
+│  │        ├─ Log detailed error info                           │    │
+│  │        └─ Save first_failure_info                           │    │
+│  │                                                              │    │
+│  │ 7. Commit Transaction                                       │    │
+│  │    conn.commit()                                            │    │
+│  │                                                              │    │
+│  │ 8. Return Statistics                                        │    │
+│  │    return {                                                 │    │
+│  │        chunk_id: N,                                         │    │
+│  │        rows_inserted: X,                                    │    │
+│  │        rows_failed: Y,                                      │    │
+│  │        success: True/False,                                 │    │
+│  │        elapsed: seconds                                     │    │
+│  │    }                                                         │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   ATOMIC ROLLBACK DECISION                          │
+│                                                                      │
+│  After all chunks processed:                                        │
+│                                                                      │
+│  if atomic_load = True AND failed_rows > 0:                         │
+│      │                                                               │
+│      ├─ Log: "ATOMIC MODE: Failure detected"                        │
+│      ├─ Log: "First failure: Chunk X - error message"               │
+│      │                                                               │
+│      ├─ Execute: TRUNCATE TABLE table_name                          │
+│      │   (Removes ALL data - even successful chunks)                │
+│      │                                                               │
+│      ├─ Set total_rows = 0                                          │
+│      └─ Set atomic_rollback = True                                  │
+│                                                                      │
+│  else:                                                               │
+│      └─ Data remains in table (successful load)                     │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      RETURN STATISTICS                              │
+│                                                                      │
+│  return {                                                            │
+│      'total_rows': N,              # 0 if rolled back               │
+│      'failed_rows': X,                                               │
+│      'total_processed': N + X,                                       │
+│      'total_chunks': count,                                          │
+│      'success': True/False,                                          │
+│      'elapsed_seconds': time,                                        │
+│      'rows_per_second': rate,                                        │
+│      'atomic_rollback': True/False,                                  │
+│      'failed_chunks': [list],                                        │
+│      'first_failure': {info}                                         │
+│  }                                                                   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      DISPLAY STATISTICS                             │
+│                                                                      │
+│  ======================================================================│
+│                         LOAD STATISTICS                              │
+│  ======================================================================│
+│  Load Mode:                           ATOMIC (All-or-Nothing)        │
+│  Total Rows Loaded:                                           0      │
+│  Failed Rows:                                            10,000      │
+│  Total Processed:                                        50,000      │
+│  Total Chunks:                                                5      │
+│  Elapsed Time:                                           5.64 sec    │
+│  Throughput:                                         8,865 rows/sec  │
+│  ======================================================================│
+│                   ⚠️  ATOMIC ROLLBACK EXECUTED  ⚠️                    │
+│  ======================================================================│
+│  Rows Before Rollback:                                       40,000  │
+│  Rows After Rollback:                                             0  │
+│  First Failed Chunk:                                              5  │
+│  Failure Reason:                                                     │
+│    ORA-01722: invalid number                                         │
+│  ======================================================================│
+│  Final Status:                                 ❌ ALL DATA TRUNCATED │
+│  ======================================================================│
+│                                                                      │
+│  Exit Code: 1 (Failure)                                              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+***
+
+## Detailed Execution Flow
+
+### Phase 1: Initialization
+```
+START
+  │
+  ├─ Import all modules
+  ├─ Setup logging (file + console)
+  ├─ Create AppConfig (hardcoded)
+  │   ├─ database.user = 'scott'
+  │   ├─ database.password = 'tiger'
+  │   ├─ database.dsn = 'localhost:1521/XEPDB1'
+  │   ├─ file.input_file = 'data.csv'
+  │   ├─ loader.staging_table = 'STG_DATA_LOAD'
+  │   ├─ loader.chunk_size = 10000
+  │   └─ loader.create_table = True (DEFAULT)
+  │
+  └─ Create DataLoaderApp(config)
+```
+
+### Phase 2: File Validation & Parser Creation
+```
+File Validation
+  │
+  ├─ Check file exists
+  │   └─ If not: Log error, exit(1)
+  │
+  ├─ Get file extension
+  │   ├─ .csv → Create CSVParser
+  │   └─ .xml → Create XMLParser
+  │
+  └─ Validate file format
+      ├─ CSV: Read first 5 rows
+      └─ XML: Validate against XSD (if provided)
+```
+
+### Phase 3: Connection Pool Creation
+```
+Connection Pool
+  │
+  ├─ oracledb.create_pool(
+  │      user='scott',
+  │      password='tiger',
+  │      dsn='localhost:1521/XEPDB1',
+  │      min=2,
+  │      max=10,
+  │      threaded=True
+  │  )
+  │
+  ├─ Test connection
+  │   └─ If fails: Log error, exit(1)
+  │
+  └─ Pool ready (2 connections pre-created)
+```
+
+### Phase 4: Table Creation
+```
+Table Creation (create_table=True, drop_if_exists=True)
+  │
+  ├─ Get first chunk from parser
+  │   └─ Infer schema from DataFrame
+  │
+  ├─ DROP TABLE (if exists)
+  │   SQL: DROP TABLE STG_DATA_LOAD PURGE
+  │   └─ Ignore error if table doesn't exist
+  │
+  ├─ Map pandas dtypes → Oracle types
+  │   ├─ int64 → NUMBER
+  │   ├─ float64 → NUMBER  
+  │   ├─ object → VARCHAR2(4000)
+  │   └─ datetime64 → TIMESTAMP
+  │
+  ├─ Sanitize column names
+  │   'First Name' → 'FIRST_NAME'
+  │
+  ├─ BUILD CREATE SQL
+  │   CREATE TABLE STG_DATA_LOAD (
+  │       ID NUMBER,
+  │       FIRST_NAME VARCHAR2(4000),
+  │       AGE NUMBER,
+  │       SALARY NUMBER
+  │   )
+  │
+  └─ EXECUTE CREATE
+      └─ Table now exists, empty
+```
+
+### Phase 5: Sequential Chunk Loading
+```
+Sequential Processing (atomic_load=True)
+  │
+  ├─ Chunk 0 (first_chunk already read)
+  │   ├─ _load_chunk(chunk, 0)
+  │   ├─ INSERT 10,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 10,000 inserted, 0 failed ✓
+  │
+  ├─ Chunk 1
+  │   ├─ _load_chunk(chunk, 1)
+  │   ├─ INSERT 10,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 10,000 inserted, 0 failed ✓
+  │
+  ├─ Chunk 2
+  │   ├─ _load_chunk(chunk, 2)
+  │   ├─ INSERT 10,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 10,000 inserted, 0 failed ✓
+  │
+  ├─ Chunk 3
+  │   ├─ _load_chunk(chunk, 3)
+  │   ├─ INSERT 10,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 10,000 inserted, 0 failed ✓
+  │
+  ├─ Chunk 4
+  │   ├─ _load_chunk(chunk, 4)
+  │   ├─ INSERT 10,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 10,000 inserted, 0 failed ✓
+  │
+  └─ Chunk 5
+      ├─ _load_chunk(chunk, 5)
+      ├─ Row 50,004 has invalid data (e.g., "ABC" in NUMBER column)
+      ├─ ERROR: ORA-01722: invalid number
+      ├─ Set failure_event
+      ├─ Log detailed error
+      └─ Result: 0 inserted, 10,000 failed ✗
+```
+
+### Phase 6: Atomic Rollback
+```
+Rollback Decision
+  │
+  ├─ Check: atomic_load = True? YES
+  ├─ Check: failed_rows > 0? YES (10,000 failed)
+  │
+  ├─ LOG: "ATOMIC MODE: Failure detected"
+  ├─ LOG: "First failure: Chunk 5 - ORA-01722"
+  ├─ LOG: "Rows before rollback: 50,000"
+  │
+  ├─ EXECUTE: TRUNCATE TABLE STG_DATA_LOAD
+  │   └─ Removes all 50,000 rows (including successful chunks 0-4)
+  │
+  ├─ Set total_rows = 0
+  └─ Set atomic_rollback = True
+```
+
+### Phase 7: Statistics & Exit
+```
+Return Statistics
+  {
+      total_rows: 0,
+      failed_rows: 10000,
+      total_processed: 60000,
+      total_chunks: 6,
+      success: False,
+      atomic_rollback: True,
+      first_failure: {
+          chunk_id: 5,
+          error: "ORA-01722: invalid number"
+      }
+  }
+  
+Display to Console
+  └─ Print formatted statistics
+  
+Cleanup
+  ├─ Close connection pool
+  └─ Exit with code 1 (failure)
+```
+
+***
+
+## Key Characteristics of Original Design
+
+### ✅ Strengths
+1. **Atomic integrity**: All-or-nothing ensures data consistency
+2. **Auto-creates tables**: No manual DDL needed
+3. **Sequential processing**: Detects failures immediately
+4. **Detailed logging**: Every operation logged
+5. **Memory efficient**: Chunk-based processing
+
+### ⚠️ Limitations
+1. **No command-line args**: All config hardcoded in code
+2. **Always drops table**: Can't use existing tables easily
+3. **No truncate option**: Must drop+create
+4. **Fixed delimiter**: CSV comma-only initially
+5. **Requires code changes**: Can't change settings without editing code
+
+This is the **original design** before adding command-line arguments and truncate functionality ![1]
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/5992b391-f10b-45d0-81e4-fd50e4c4edbf/1000143971.jpg)
