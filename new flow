@@ -1,0 +1,636 @@
+Perfect! Here's the comprehensive design flow for the **latest version** with command-line arguments and truncate functionality:[1]
+
+***
+
+# Enterprise Data Loader - Latest Design Flow (v2.0)
+
+## System Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    USER / COMMAND-LINE EXECUTION                     │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │  python main.py \                                            │  │
+│  │    --file data.csv \                                         │  │
+│  │    --table STG_EMPLOYEES \                                   │  │
+│  │    --user scott \                                            │  │
+│  │    --password tiger \                                        │  │
+│  │    --dsn localhost:1521/XEPDB1 \                             │  │
+│  │    --delimiter ',' \                                         │  │
+│  │    --chunk-size 10000 \                                      │  │
+│  │    --batch-errors                                            │  │
+│  │                                                              │  │
+│  │  OR use environment variables:                               │  │
+│  │  export ORACLE_USER=scott                                    │  │
+│  │  export ORACLE_PASSWORD=tiger                                │  │
+│  │  python main.py --file data.csv --table STG_EMPLOYEES        │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   ARGUMENT PARSING (argparse)                       │
+│                                                                      │
+│  parse_arguments()                                                   │
+│  ├─ Required Arguments:                                              │
+│  │   ├─ --file / -f                                                  │
+│  │   └─ --table / -t                                                 │
+│  │                                                                    │
+│  ├─ Database Options:                                                │
+│  │   ├─ --user / -u (default: $ORACLE_USER)                          │
+│  │   ├─ --password / -p (default: $ORACLE_PASSWORD)                  │
+│  │   └─ --dsn (default: $ORACLE_DSN)                                 │
+│  │                                                                    │
+│  ├─ File Format Options:                                             │
+│  │   ├─ --delimiter / -d (default: ',')                              │
+│  │   ├─ --encoding / -e (default: 'utf-8')                           │
+│  │   ├─ --xml-tag (default: 'record')                                │
+│  │   └─ --schema (optional XSD file)                                 │
+│  │                                                                    │
+│  └─ Loader Options:                                                  │
+│      ├─ --chunk-size (default: 10000)                                │
+│      ├─ --batch-errors (flag)                                        │
+│      ├─ --create-table (flag, default: False)                        │
+│      ├─ --drop-table (flag, default: False)                          │
+│      └─ --no-truncate (flag, default: truncate=True)                 │
+│                                                                       │
+│  Returns: args namespace                                             │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  CONFIGURATION BUILDING (main)                      │
+│                                                                      │
+│  config = AppConfig()                                                │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ Database Config (from args)                                 │    │
+│  │ ├─ config.database.user = args.user                         │    │
+│  │ ├─ config.database.password = args.password                 │    │
+│  │ ├─ config.database.dsn = args.dsn                           │    │
+│  │ ├─ config.database.min_pool_conn = 2                        │    │
+│  │ └─ config.database.max_pool_conn = 10                       │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ File Config (from args)                                     │    │
+│  │ ├─ config.file.input_file = args.file                       │    │
+│  │ ├─ config.file.file_encoding = args.encoding                │    │
+│  │ ├─ config.file.csv_delimiter = args.delimiter               │    │
+│  │ ├─ config.file.xml_record_tag = args.xml_tag                │    │
+│  │ ├─ config.file.xml_schema_file = args.schema                │    │
+│  │ └─ config.file.validate_schema = not args.no_validate       │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ Loader Config (from args) - NEW DEFAULTS                    │    │
+│  │ ├─ config.loader.staging_table = args.table                 │    │
+│  │ ├─ config.loader.chunk_size = args.chunk_size               │    │
+│  │ ├─ config.loader.batch_errors = args.batch_errors           │    │
+│  │ ├─ config.loader.create_table = args.create_table (False)   │    │
+│  │ ├─ config.loader.drop_if_exists = args.drop_table (False)   │    │
+│  │ └─ config.loader.truncate_before_load = not args.no_truncate│    │
+│  │                                          (True by default)   │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Log all configuration settings                                     │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     DataLoaderApp.run()                             │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 1. INITIALIZATION PHASE                                     │    │
+│  │    ├─ Setup logging (LoggerFactory)                         │    │
+│  │    ├─ Validate file exists                                  │    │
+│  │    └─ Initialize connection pool                            │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 2. PARSER SELECTION PHASE                                   │    │
+│  │    ├─ Get file extension (.csv or .xml)                     │    │
+│  │    ├─ Create CSVParser with delimiter                       │    │
+│  │    │   OR XMLParser with record tag                         │    │
+│  │    └─ Validate file format                                  │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 3. LOADER INITIALIZATION PHASE (NEW)                        │    │
+│  │    Create DataLoader with:                                  │    │
+│  │    ├─ pool (connection pool)                                │    │
+│  │    ├─ table_name                                            │    │
+│  │    ├─ chunk_size (from args)                                │    │
+│  │    ├─ max_workers = 4                                       │    │
+│  │    ├─ batch_errors (from args)                              │    │
+│  │    ├─ atomic_load = True                                    │    │
+│  │    └─ truncate_before_load (from args, default True) ◄ NEW  │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 4. DATA LOADING PHASE (MODIFIED)                            │    │
+│  │    Call loader.load_from_generator()                        │    │
+│  │    ├─ create_table (from args, default False) ◄ CHANGED     │    │
+│  │    └─ drop_if_exists (from args, default False) ◄ CHANGED   │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ 5. STATISTICS DISPLAY PHASE                                 │    │
+│  │    └─ Print results to console                              │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│               CONNECTION POOL (OracleConnectionPool)                │
+│                          (Same as before)                            │
+│                                                                      │
+│  oracledb.create_pool()                                              │
+│  ├─ user, password, dsn (from command-line args)                    │
+│  ├─ min = 2 connections                                              │
+│  ├─ max = 10 connections                                             │
+│  ├─ threaded = True                                                  │
+│  └─ getmode = WAIT                                                   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    PARSER (CSV or XML)                              │
+│                 (Enhanced with delimiter support)                    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ CSVParser.parse() - Generator Pattern                       │    │
+│  │                                                              │    │
+│  │ pd.read_csv(file, chunksize=10000, sep=delimiter) ◄ NEW     │    │
+│  │     │                                                        │    │
+│  │     ├─ Supports: ',' (comma)                                │    │
+│  │     ├─ Supports: '|' (pipe)                                 │    │
+│  │     ├─ Supports: '\t' (tab)                                 │    │
+│  │     └─ Supports: ';' (semicolon)                            │    │
+│  │                                                              │    │
+│  │ Yields chunks one at a time                                 │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 DataLoader.load_from_generator()                    │
+│                        (MODIFIED LOGIC)                              │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ STEP 1: Get First Chunk                                     │    │
+│  │ ├─ first_chunk = next(generator)                            │    │
+│  │ └─ Validate DataFrame                                       │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ STEP 2: TABLE PREPARATION (NEW LOGIC)                       │    │
+│  │                                                              │    │
+│  │ if create_table = True:                                     │    │
+│  │     ├─ Log: "create_table=True - Creating table"            │    │
+│  │     │                                                        │    │
+│  │     ├─ if drop_if_exists:                                   │    │
+│  │     │   └─ DROP TABLE table_name PURGE                      │    │
+│  │     │                                                        │    │
+│  │     └─ create_table_from_dataframe(first_chunk)             │    │
+│  │         └─ CREATE TABLE with inferred schema                │    │
+│  │                                                              │    │
+│  │ else: (DEFAULT BEHAVIOR - NEW)                              │    │
+│  │     ├─ Log: "Using existing table (create_table=False)"     │    │
+│  │     │                                                        │    │
+│  │     └─ if truncate_before_load = True: (DEFAULT)            │    │
+│  │         │                                                    │    │
+│  │         └─ _truncate_before_load() ◄ NEW METHOD             │    │
+│  │             │                                                │    │
+│  │             ├─ Log: "PRE-LOAD TABLE TRUNCATION"             │    │
+│  │             ├─ SQL: TRUNCATE TABLE table_name               │    │
+│  │             ├─ COMMIT                                        │    │
+│  │             ├─ Log: "✓ Table truncated successfully"        │    │
+│  │             │                                                │    │
+│  │             └─ If fails:                                     │    │
+│  │                 ├─ Log: "Table must exist before loading!"  │    │
+│  │                 └─ RAISE ERROR (stop execution)             │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │ STEP 3: SEQUENTIAL CHUNK PROCESSING                         │    │
+│  │         (Same as before - Atomic Mode)                      │    │
+│  │                                                              │    │
+│  │ Process chunks sequentially, stop on first failure          │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DataLoader._load_chunk()                         │
+│                        (Same as before)                              │
+│                                                                      │
+│  Sequential chunk loading with batch insert                         │
+│  ├─ Check failure_event                                              │
+│  ├─ Acquire connection                                               │
+│  ├─ Prepare INSERT statement                                         │
+│  ├─ Clean data (NaN → None)                                          │
+│  ├─ Execute batch insert                                             │
+│  ├─ Handle errors (set failure_event if error)                       │
+│  ├─ Commit transaction                                               │
+│  └─ Return statistics                                                │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   ATOMIC ROLLBACK DECISION                          │
+│                   (Uses _truncate_table - same as before)            │
+│                                                                      │
+│  After all chunks processed:                                        │
+│                                                                      │
+│  if atomic_load = True AND failed_rows > 0:                         │
+│      │                                                               │
+│      ├─ Log: "ATOMIC MODE: Failure detected"                        │
+│      ├─ Log: "First failure: Chunk X - error message"               │
+│      │                                                               │
+│      ├─ _truncate_table() ◄ ROLLBACK TRUNCATE                       │
+│      │   └─ SQL: TRUNCATE TABLE table_name                          │
+│      │       (Removes ALL data including successful chunks)          │
+│      │                                                               │
+│      ├─ Set total_rows = 0                                          │
+│      └─ Set atomic_rollback = True                                  │
+│                                                                      │
+│  else:                                                               │
+│      └─ Data remains in table (successful load)                     │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      RETURN STATISTICS                              │
+│                                                                      │
+│  return {                                                            │
+│      'total_rows': N,                                                │
+│      'failed_rows': X,                                               │
+│      'total_processed': N + X,                                       │
+│      'total_chunks': count,                                          │
+│      'success': True/False,                                          │
+│      'elapsed_seconds': time,                                        │
+│      'rows_per_second': rate,                                        │
+│      'atomic_rollback': True/False,                                  │
+│      'failed_chunks': [list],                                        │
+│      'first_failure': {info}                                         │
+│  }                                                                   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      DISPLAY STATISTICS                             │
+│                    (Enhanced with config info)                       │
+│                                                                      │
+│  Shows same statistics plus configuration details                   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                           EXIT                                       │
+│                                                                      │
+│  sys.exit(0 if success else 1)                                      │
+│  └─ Unix exit codes for shell scripting                             │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+***
+
+## Detailed Execution Flow - Latest Version
+
+### Phase 1: Command-Line Argument Parsing
+```
+Command Line:
+  python main.py --file data.csv --table EXISTING_TABLE --delimiter '|' --chunk-size 50000
+
+parse_arguments()
+  │
+  ├─ Parse required arguments
+  │   ├─ file = 'data.csv'
+  │   └─ table = 'EXISTING_TABLE'
+  │
+  ├─ Parse optional arguments
+  │   ├─ user = $ORACLE_USER or default
+  │   ├─ password = $ORACLE_PASSWORD or default
+  │   ├─ dsn = $ORACLE_DSN or default
+  │   ├─ delimiter = '|' ◄ Specified
+  │   ├─ encoding = 'utf-8' (default)
+  │   ├─ chunk_size = 50000 ◄ Specified
+  │   ├─ batch_errors = False (default)
+  │   ├─ create_table = False (default - NEW)
+  │   ├─ drop_table = False (default - NEW)
+  │   └─ no_truncate = False (so truncate = True)
+  │
+  └─ Return args namespace
+```
+
+### Phase 2: Configuration Building
+```
+main()
+  │
+  ├─ Create config from args
+  │   │
+  │   ├─ Database Config
+  │   │   ├─ user from args or env
+  │   │   ├─ password from args or env
+  │   │   └─ dsn from args or env
+  │   │
+  │   ├─ File Config
+  │   │   ├─ input_file = 'data.csv'
+  │   │   ├─ csv_delimiter = '|' ◄ Pipe-delimited
+  │   │   └─ file_encoding = 'utf-8'
+  │   │
+  │   └─ Loader Config (NEW DEFAULTS)
+  │       ├─ staging_table = 'EXISTING_TABLE'
+  │       ├─ chunk_size = 50000
+  │       ├─ batch_errors = False
+  │       ├─ create_table = False ◄ Use existing
+  │       ├─ drop_if_exists = False ◄ Don't drop
+  │       └─ truncate_before_load = True ◄ DO truncate
+  │
+  └─ Log all configuration settings
+```
+
+### Phase 3: Parser Creation with Custom Delimiter
+```
+_get_parser()
+  │
+  ├─ File extension: .csv
+  │
+  └─ Create CSVParser(
+        file_path='data.csv',
+        chunk_size=50000,
+        encoding='utf-8',
+        delimiter='|' ◄ Pipe-delimited support
+    )
+    
+Parser logs:
+  INFO - CSV Parser initialized with delimiter: '|'
+```
+
+### Phase 4: Table Preparation (NEW LOGIC)
+```
+load_from_generator(create_table=False, drop_if_exists=False)
+  │
+  ├─ Get first chunk
+  │   └─ Read 50,000 rows from pipe-delimited CSV
+  │
+  ├─ Validate DataFrame
+  │
+  └─ Table Preparation Decision Tree
+      │
+      ├─ Is create_table = True?
+      │   └─ NO (False by default now)
+      │
+      ├─ Log: "Using existing table (create_table=False)"
+      │
+      └─ Is truncate_before_load = True?
+          └─ YES (True by default)
+              │
+              └─ _truncate_before_load() ◄ NEW METHOD
+                  │
+                  ├─ Log: "PRE-LOAD TABLE TRUNCATION"
+                  ├─ Log: "Table: EXISTING_TABLE"
+                  │
+                  ├─ Execute: TRUNCATE TABLE EXISTING_TABLE
+                  │   │
+                  │   ├─ If SUCCESS:
+                  │   │   ├─ COMMIT
+                  │   │   ├─ Log: "✓ Table truncated successfully"
+                  │   │   └─ Log: "Table is now empty and ready"
+                  │   │
+                  │   └─ If FAILS:
+                  │       ├─ Log: "✗ TRUNCATE failed: ORA-00942"
+                  │       ├─ Log: "Table must exist before loading!"
+                  │       ├─ Log: "Create table manually or use --create-table"
+                  │       └─ RAISE ERROR (stop execution)
+                  │
+                  └─ Continue to chunk processing
+
+Database State After Phase 4:
+  EXISTING_TABLE exists and is EMPTY (truncated)
+```
+
+### Phase 5: Sequential Chunk Loading
+```
+Sequential Processing (same as before, but larger chunks)
+  │
+  ├─ Chunk 0 (50,000 rows)
+  │   ├─ _load_chunk(chunk, 0)
+  │   ├─ INSERT 50,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 50,000 inserted ✓
+  │
+  ├─ Chunk 1 (50,000 rows)
+  │   ├─ _load_chunk(chunk, 1)
+  │   ├─ INSERT 50,000 rows
+  │   ├─ COMMIT
+  │   └─ Result: 50,000 inserted ✓
+  │
+  └─ ... continue until file complete or failure
+```
+
+### Phase 6: Atomic Rollback (Same Logic)
+```
+If any chunk fails:
+  │
+  ├─ _truncate_table() ◄ Same method as pre-load truncate
+  │   └─ TRUNCATE TABLE EXISTING_TABLE
+  │
+  ├─ Set total_rows = 0
+  └─ Set atomic_rollback = True
+
+Result: Table is EMPTY (all data removed)
+```
+
+***
+
+## Comparison: Old vs New Execution Paths
+
+### Scenario 1: Default Behavior Comparison
+
+**OLD VERSION (Original)**:
+```
+python main.py
+  → Hardcoded config in code
+  → create_table = True (default)
+  → drop_if_exists = True (default)
+  → DROP TABLE (if exists)
+  → CREATE TABLE from file schema
+  → Load data
+```
+
+**NEW VERSION (Latest)**:
+```
+python main.py --file data.csv --table EXISTING_TABLE
+  → Config from command-line
+  → create_table = False (default)
+  → truncate_before_load = True (default)
+  → TRUNCATE TABLE (must exist)
+  → Load data into existing table
+```
+
+### Scenario 2: Table Creation
+
+**OLD VERSION**:
+```
+Always creates table (default behavior)
+No way to use existing table easily
+```
+
+**NEW VERSION**:
+```
+# Use existing table (default)
+python main.py --file data.csv --table EXISTING_TABLE
+
+# Create new table
+python main.py --file data.csv --table NEW_TABLE --create-table
+
+# Drop and recreate
+python main.py --file data.csv --table OLD_TABLE --create-table --drop-table
+```
+
+### Scenario 3: Delimiter Support
+
+**OLD VERSION**:
+```
+Only comma-delimited CSVs
+Hardcoded delimiter = ','
+```
+
+**NEW VERSION**:
+```
+# Comma (default)
+python main.py --file data.csv --table TBL
+
+# Pipe-delimited
+python main.py --file data.psv --table TBL --delimiter '|'
+
+# Tab-delimited
+python main.py --file data.tsv --table TBL --delimiter $'\t'
+
+# Semicolon-delimited
+python main.py --file data.csv --table TBL --delimiter ';'
+```
+
+***
+
+## Key Differences Summary
+
+| Feature | Old Version | New Version |
+|---------|------------|-------------|
+| **Configuration** | Hardcoded in code | Command-line arguments |
+| **Default Behavior** | Create table (DROP+CREATE) | Use existing table (TRUNCATE) |
+| **Table Prep** | DROP → CREATE | TRUNCATE (existing) |
+| **Delimiter** | Fixed comma | Configurable (,\|;\t) |
+| **Credentials** | In code | Command-line or env vars |
+| **Truncate Option** | Not available | `--no-truncate` flag |
+| **Create Table** | Default ON | Default OFF, `--create-table` flag |
+| **Drop Table** | Default ON | Default OFF, `--drop-table` flag |
+| **Flexibility** | Low (edit code) | High (command-line) |
+| **CI/CD Ready** | No | Yes (env vars + args) |
+| **Help System** | No | `--help` with examples |
+| **Exit Codes** | Yes | Yes |
+
+***
+
+## Two Truncate Methods Explained
+
+### 1. `_truncate_before_load()` - Pre-Load Cleanup
+```python
+Purpose: Empty existing table before loading new data
+When: At start of load (before any chunks)
+Why: Prepare table for fresh data
+
+Usage Flow:
+  Start → Truncate → Load chunks → Success/Failure
+```
+
+### 2. `_truncate_table()` - Atomic Rollback
+```python
+Purpose: Remove partial data after failure
+When: After chunks processed, if any failed
+Why: Ensure all-or-nothing data integrity
+
+Usage Flow:
+  Start → Load chunks → Failure detected → Truncate → Exit
+```
+
+### Example: Both Truncates in Action
+```
+1. PRE-LOAD TRUNCATE
+   ├─ Table has 1M old rows
+   ├─ Execute: TRUNCATE TABLE
+   └─ Table now has 0 rows
+
+2. LOAD CHUNKS
+   ├─ Chunk 0: ✓ 50,000 inserted (total: 50,000)
+   ├─ Chunk 1: ✓ 50,000 inserted (total: 100,000)
+   ├─ Chunk 2: ✓ 50,000 inserted (total: 150,000)
+   └─ Chunk 3: ✗ FAILED
+
+3. ATOMIC ROLLBACK TRUNCATE
+   ├─ Table has 150,000 new rows
+   ├─ Execute: TRUNCATE TABLE
+   └─ Table now has 0 rows
+
+Final Result: 0 rows (all-or-nothing)
+```
+
+***
+
+## Enhanced Command-Line Help
+
+```bash
+$ python main.py --help
+
+usage: main.py [-h] --file FILE --table TABLE [--user USER] 
+               [--password PASSWORD] [--dsn DSN] [--delimiter DELIMITER]
+               [--encoding ENCODING] [--xml-tag XML_TAG] [--schema SCHEMA]
+               [--chunk-size CHUNK_SIZE] [--batch-errors] [--create-table]
+               [--drop-table] [--no-truncate] [--no-validate]
+
+Enterprise Data Loader - Load CSV/XML files into Oracle
+
+Required arguments:
+  --file FILE, -f FILE   Path to input file (CSV or XML)
+  --table TABLE, -t TABLE Target Oracle table name
+
+Database Options:
+  --user USER, -u USER   Oracle username (default: $ORACLE_USER)
+  --password PASSWORD    Oracle password (default: $ORACLE_PASSWORD)
+  --dsn DSN              Oracle DSN (default: $ORACLE_DSN)
+
+File Format Options:
+  --delimiter DELIMITER  CSV delimiter (default: ",")
+  --encoding ENCODING    File encoding (default: utf-8)
+  --xml-tag XML_TAG      XML record tag (default: record)
+  --schema SCHEMA        XML schema file (XSD)
+
+Loader Options:
+  --chunk-size N         Rows per chunk (default: 10000)
+  --batch-errors         Continue on row-level errors
+  --create-table         Create table from file schema
+  --drop-table           Drop table before creation
+  --no-truncate          Don't truncate before loading
+  --no-validate          Skip file validation
+
+Examples:
+  # Load into existing table (default)
+  python main.py --file data.csv --table STG_EMPLOYEES
+  
+  # Pipe-delimited file
+  python main.py --file data.psv --table STG_DATA --delimiter '|'
+  
+  # Create new table
+  python main.py --file data.csv --table NEW_TABLE --create-table
+```
+
+***
+
+This is the **complete latest design** with all new features: command-line arguments, configurable delimiters, truncate-before-load, and flexible table management ![1]
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/5992b391-f10b-45d0-81e4-fd50e4c4edbf/1000143971.jpg)
