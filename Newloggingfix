@@ -1,0 +1,86 @@
+still getting 2 logs
+
+I can see from your screenshots that you're still getting multiple log entries from different processes. The issue is that you need to **prevent child processes from re-evaluating the timestamp**. 
+
+Here's the **corrected fix** - you need to make one more change:
+
+***
+
+### **Complete Fix - Replace the top logging section with this:**
+
+**FIND THIS:**
+```python
+# Generate log file name ONCE at module level
+LOG_FILE = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+
+def setup_logging():
+    """Configure logging to use a single shared log file"""
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+        force=True
+    )
+```
+
+**REPLACE WITH:**
+```python
+# Generate log file name ONCE at module level - must be before any imports or function definitions
+LOG_FILE = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+
+def setup_logging():
+    """Configure logging to use a single shared log file"""
+    # Use a handler approach instead of basicConfig for better control
+    logger = logging.getLogger()
+    
+    # Clear existing handlers to avoid duplicates
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    logger.setLevel(logging.INFO)
+    
+    # Create file handler with the shared LOG_FILE
+    handler = logging.FileHandler(LOG_FILE, mode='a')
+    handler.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    # Add handler to logger
+    logger.addHandler(handler)
+```
+
+***
+
+### **Alternative Simpler Fix (if above doesn't work)**
+
+Add this to prevent multiprocessing from spawning new Python interpreters:
+
+**ADD THIS LINE** right after your imports, before any other code:
+
+```python
+import oracledb
+import csv
+import logging
+from datetime import datetime
+from multiprocessing import Process, Queue, cpu_count
+import time
+import sys
+
+# Add this line to fix multiprocessing on Windows
+if __name__ == '__main__':
+    from multiprocessing import freeze_support
+    freeze_support()
+
+# Then continue with LOG_FILE definition...
+LOG_FILE = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+```
+
+***
+
+Try the **first fix** (handler approach) as it gives better control over logging in multiprocessing scenarios. This ensures all processes write to the exact same log file without creating duplicates.
+
+Citations:
+[1] selected_image_4695495282969847714.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/e6e369e6-8e33-4ec6-8311-3998c4ebe9de/selected_image_4695495282969847714.jpg?AWSAccessKeyId=ASIA2F3EMEYEVPJVAB6B&Signature=JfOdW%2F59JJnNIU%2Bfb0ZPZLuBwXs%3D&x-amz-security-token=IQoJb3JpZ2luX2VjEMD%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaCXVzLWVhc3QtMSJIMEYCIQD3xcxfTPZ0FuQd2%2BdTUEzq6ekkSOgmB31nc7dBIonVZAIhAJz0bUw%2B5zkQyvYASEkfP9sBkMd7M55Ie9vUyMW7grbsKvwECIn%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEQARoMNjk5NzUzMzA5NzA1IgyLmlyOob8BXxJRvuAq0AQCB9Y0KNul%2FWJZFAo%2Bp%2FUd7N728DZYPp7eCNA9puFGlHxEx8%2FI16KzWdSAKXmZ4CmxRKxhzCsg3GFU3%2FkfWBgq32qONmfXt4i7zIDBzUjondVJwEfp13vGDgEAlGZ4J90FPy5WRq1qfFNTcSp2ACPoTKfOr%2B7HYopXQVw0ITKeJMoYK9Yb3t1H5UVGt4c2JWmg4A673qlXc5GOzbBkkeTJPquW%2FAQDXdd2QAKOBXHkSbc0z23H50HqFF3RcuxIho%2B8DLIJZdP%2FZTIBW%2BYxOWicHKAt1KvCzleCDtSAQ5CxVGYmJUkvtjoCP%2BjA6xWzh5OHNDxcxgkQAAzIHG62Vkn0024MsXcESOT1OJVCjQLuhpq%2BaJSz9cJZaU8cF6D1P%2FB8rJgSdfAgkEwqPvDHqkW%2FR7F1mVhAmdEOSz3RKom8PW2%2B0tspCsgvlRSjftQq4VRkkz4yXqsydwtI3EEENF%2Bdb81Yw9RBtOFAsJRjmavkI%2FCatTaoD4H9oSnP51XP4CR%2BgjFgyW5qfkkq7EYtaqEOpuvZQw1xsWPJNNY4E8bXnFMYzmxgWIjWtGr4NDFutLBJJvcAeimSL21ak2OA8sUODGar%2F43LFsOD17mlRnLs%2FwAfwcYZRCh8ZimR9ly0PJOSzdFHPLwxsxaFF9RseJoeEyxTfS%2FHN2AsW6rs0fxhoMlUm8LhjiFGQikmlRUbNaiZVVP5REgdZNOLiRCmUXsKEIFy9l6ix8LM9EfUG3PnYHSbSS3F6DJdjKXI1aRSa7ZkopC9SNGKRT1ZE%2BYYO3nnMPSDrMgGOpcBdzKZXu%2B%2BcsDT9tXINXjjveOwIVztYOMYG%2BCdG9G9UTIOfXFaE4G2qShrKZYjYnP08K%2Fcp86INvbw3fzGGVMKtDIvRnbifXA8FtdDss3yeFMB6LvGRq9zI1qmBut%2F%2FN4l9wxQRvN9OuA1GHIcGbg11ppngCtu1I4ogEdi0Pj44zwq8%2F7P7PE2WGXmBepc%2FSbfnUWLstdZXA%3D%3D&Expires=1764921774
+[2] selected_image_7109357792060058343.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/71d529ae-727e-4e69-8d2d-842123a20f5f/selected_image_7109357792060058343.jpg?AWSAccessKeyId=ASIA2F3EMEYEVPJVAB6B&Signature=kwRIBI3ok%2BYa0%2FxYXEYWSu450VM%3D&x-amz-security-token=IQoJb3JpZ2luX2VjEMD%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaCXVzLWVhc3QtMSJIMEYCIQD3xcxfTPZ0FuQd2%2BdTUEzq6ekkSOgmB31nc7dBIonVZAIhAJz0bUw%2B5zkQyvYASEkfP9sBkMd7M55Ie9vUyMW7grbsKvwECIn%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEQARoMNjk5NzUzMzA5NzA1IgyLmlyOob8BXxJRvuAq0AQCB9Y0KNul%2FWJZFAo%2Bp%2FUd7N728DZYPp7eCNA9puFGlHxEx8%2FI16KzWdSAKXmZ4CmxRKxhzCsg3GFU3%2FkfWBgq32qONmfXt4i7zIDBzUjondVJwEfp13vGDgEAlGZ4J90FPy5WRq1qfFNTcSp2ACPoTKfOr%2B7HYopXQVw0ITKeJMoYK9Yb3t1H5UVGt4c2JWmg4A673qlXc5GOzbBkkeTJPquW%2FAQDXdd2QAKOBXHkSbc0z23H50HqFF3RcuxIho%2B8DLIJZdP%2FZTIBW%2BYxOWicHKAt1KvCzleCDtSAQ5CxVGYmJUkvtjoCP%2BjA6xWzh5OHNDxcxgkQAAzIHG62Vkn0024MsXcESOT1OJVCjQLuhpq%2BaJSz9cJZaU8cF6D1P%2FB8rJgSdfAgkEwqPvDHqkW%2FR7F1mVhAmdEOSz3RKom8PW2%2B0tspCsgvlRSjftQq4VRkkz4yXqsydwtI3EEENF%2Bdb81Yw9RBtOFAsJRjmavkI%2FCatTaoD4H9oSnP51XP4CR%2BgjFgyW5qfkkq7EYtaqEOpuvZQw1xsWPJNNY4E8bXnFMYzmxgWIjWtGr4NDFutLBJJvcAeimSL21ak2OA8sUODGar%2F43LFsOD17mlRnLs%2FwAfwcYZRCh8ZimR9ly0PJOSzdFHPLwxsxaFF9RseJoeEyxTfS%2FHN2AsW6rs0fxhoMlUm8LhjiFGQikmlRUbNaiZVVP5REgdZNOLiRCmUXsKEIFy9l6ix8LM9EfUG3PnYHSbSS3F6DJdjKXI1aRSa7ZkopC9SNGKRT1ZE%2BYYO3nnMPSDrMgGOpcBdzKZXu%2B%2BcsDT9tXINXjjveOwIVztYOMYG%2BCdG9G9UTIOfXFaE4G2qShrKZYjYnP08K%2Fcp86INvbw3fzGGVMKtDIvRnbifXA8FtdDss3yeFMB6LvGRq9zI1qmBut%2F%2FN4l9wxQRvN9OuA1GHIcGbg11ppngCtu1I4ogEdi0Pj44zwq8%2F7P7PE2WGXmBepc%2FSbfnUWLstdZXA%3D%3D&Expires=1764921774
