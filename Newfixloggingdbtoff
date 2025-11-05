@@ -1,0 +1,36 @@
+Looking at your screenshots, I see the actual problem - you have TWO different log files being created with different timestamps (one ends in 133157.log and another 133152.log). This happens because child processes are re-evaluating the timestamp.Root cause: On Windows, multiprocessing uses spawn method which re-imports the module, causing the timestamp to be re-evaluated.Here's the definitive fix:Solution: Use a global variable with explicit initializationREPLACE the entire logging section at the top with:import oracledb
+import csv
+import logging
+from datetime import datetime
+from multiprocessing import Process, Queue, cpu_count
+import time
+
+# Global log file - initialized in main guard
+LOG_FILE = None
+
+def init_log_file():
+    """Initialize log file name once"""
+    global LOG_FILE
+    if LOG_FILE is None:
+        LOG_FILE = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    return LOG_FILE
+
+def setup_logging():
+    """Configure logging"""
+    log_file = init_log_file()
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+        force=True
+    )THEN, at the BOTTOM of your file, REPLACE:if __name__ == '__main__':
+    extract_data_to_csv()WITH:if __name__ == '__main__':
+    # Initialize log file BEFORE any multiprocessing
+    init_log_file()
+    extract_data_to_csv()ALSO ADD at the start of csv_writer_process function:def csv_writer_process(write_queue, process_id):
+    """Dedicated writer process"""
+    # Don't call setup_logging() here - child inherits LOG_FILE
+    
+    try:
+        total_rows = 0
+        # ... rest of functionREMOVE the setup_logging() call from BOTH functions:Remove from csv_writer_process()Remove from extract_data_to_csv()This ensures the timestamp is created once in the main process before any child processes spawn, and all processes share the same filename.
