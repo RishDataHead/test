@@ -1,0 +1,87 @@
+give me only code that needs to be changed and where,not the whole code
+
+Here are **only the changes** you need to make:
+
+***
+
+### **Change 1: At the top of the file (replace the logging setup)**
+
+**FIND THIS:**
+```python
+# Configure logging
+log_file = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+logging.basicConfig(filename=log_file, level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+```
+
+**REPLACE WITH:**
+```python
+# Generate log file name ONCE at module level
+LOG_FILE = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+
+def setup_logging():
+    """Configure logging to use a single shared log file"""
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+        force=True
+    )
+```
+
+***
+
+### **Change 2: At the start of `csv_writer_process()` function**
+
+**ADD THIS as the first line inside the function:**
+```python
+def csv_writer_process(write_queue, process_id):
+    """
+    Dedicated writer process for CSV output
+    """
+    # Setup logging in child process
+    setup_logging()  # <-- ADD THIS LINE
+    
+    try:
+        total_rows = 0
+        # ... rest of function stays the same
+```
+
+***
+
+### **Change 3: At the start of `extract_data_to_csv()` function**
+
+**ADD THIS as the first line inside the function:**
+```python
+def extract_data_to_csv():
+    """
+    Main extraction function with multiprocessing for fast CSV writing
+    """
+    # Setup logging in main process
+    setup_logging()  # <-- ADD THIS LINE
+    
+    conn = None
+    cursor = None
+    # ... rest of function stays the same
+```
+
+***
+
+### **Change 4: Replace all instances of `log_file` with `LOG_FILE`**
+
+**FIND:**
+```python
+print(f'  Check log file: {log_file}')
+print(f'  Log file       : {log_file}')
+```
+
+**REPLACE WITH:**
+```python
+print(f'  Check log file: {LOG_FILE}')
+print(f'  Log file       : {LOG_FILE}')
+```
+
+***
+
+That's it! These 4 changes will fix the dual log file issue.
+
