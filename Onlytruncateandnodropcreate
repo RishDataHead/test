@@ -1,0 +1,358 @@
+give me previous code where we were not  giving command line arguments,
+only add functionality of truncating the table in which data has to be inserted and remove create and drop command from it.
+give me only code where it needs changing
+
+Perfect! You want the **original simple version** (no command-line args) but with **truncate instead of create/drop**. Here are the **ONLY TWO FILES** that need changes [1]:
+
+***
+
+## File 1: `enterprise_data_loader/loaders/data_loader.py`
+
+### Change 1: Add `truncate_before_load` parameter to `__init__`
+
+**Find (around line 30-40):**
+```python
+def __init__(self, pool, table_name, chunk_size=10000, 
+             max_workers=4, batch_errors=False, atomic_load=True):
+```
+
+**Replace with:**
+```python
+def __init__(self, pool, table_name, chunk_size=10000, 
+             max_workers=4, batch_errors=False, atomic_load=True,
+             truncate_before_load=True):
+    """
+    Initialize data loader
+    
+    Args:
+        pool: Oracle connection pool
+        table_name: Target table name
+        chunk_size: Rows per chunk
+        max_workers: Number of parallel threads
+        batch_errors: Enable batch error handling
+        atomic_load: If True, rollback all on any failure (all-or-nothing)
+        truncate_before_load: If True, truncate table before loading
+    """
+    self.pool = pool
+    self.table_name = table_name
+    self.chunk_size = chunk_size
+    self.max_workers = max_workers
+    self.batch_errors = batch_errors
+    self.atomic_load = atomic_load
+    self.truncate_before_load = truncate_before_load  # NEW
+```
+
+### Change 2: Add `_truncate_before_load()` method
+
+**Add this method after `_truncate_table()` (around line 100):**
+
+```python
+def _truncate_before_load(self):
+    """Truncate table before loading (pre-load cleanup)"""
+    logger.info("="*70)
+    logger.info("PRE-LOAD TABLE TRUNCATION")
+    logger.info(f"Table: {self.table_name}")
+    logger.info("="*70)
+    
+    try:
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            truncate_sql = f"TRUNCATE TABLE {self.table_name}"
+            logger.info(f"Executing: {truncate_sql}")
+            cursor.execute(truncate_sql)
+            conn.commit()
+            cursor.close()
+            logger.info(f"✓ Table {self.table_name} truncated successfully")
+            logger.info("  Table is now empty and ready for loading")
+    except Exception as e:
+        logger.error(f"✗ TRUNCATE failed: {str(e)}")
+        logger.error("  Table must exist before loading!")
+        raise
+    
+    logger.info("="*70)
+```
+
+### Change 3: Modify `load_from_generator()` method
+
+**Find this section (around line 350-380):**
+```python
+def load_from_generator(self, data_generator, create_table=True, drop_if_exists=True):
+    """
+    Load data from a generator with atomic all-or-nothing guarantee
+    """
+    # ... validation code ...
+    
+    # Create table if needed
+    if create_table:
+        self.create_table_from_dataframe(first_chunk, drop_if_exists)
+    
+    logger.info("="*70)
+    logger.info(f"LOAD MODE: {'ATOMIC (All-or-Nothing)' if self.atomic_load else 'BEST EFFORT'}")
+    logger.info("="*70)
+```
+
+**Replace with:**
+```python
+def load_from_generator(self, data_generator):
+    """
+    Load data from a generator with atomic all-or-nothing guarantee
+    Assumes table already exists - will truncate before loading
+    """
+    overall_start = time.time()
+    
+    # Reset state
+    self.failure_event.clear()
+    self.first_failure_info = None
+    self.total_rows = 0
+    self.failed_rows = 0
+    self.failed_chunks = []
+    
+    # Get first chunk
+    try:
+        logger.info("Reading first chunk...")
+        first_chunk = next(data_generator)
+        logger.info(f"✓ First chunk loaded: {len(first_chunk)} rows")
+    except StopIteration:
+        logger.error("✗ No data to load - file is empty")
+        return {
+            'success': False, 
+            'error': 'No data found', 
+            'total_rows': 0, 
+            'failed_rows': 0,
+            'failed_chunks': [],
+            'atomic_rollback': False
+        }
+    
+    # Validate first chunk
+    logger.info("Validating data...")
+    is_valid, error_msg = DataValidator.validate_dataframe(first_chunk)
+    if not is_valid:
+        logger.error(f"✗ Data validation failed: {error_msg}")
+        return {
+            'success': False, 
+            'error': error_msg, 
+            'total_rows': 0, 
+            'failed_rows': 0,
+            'failed_chunks': [],
+            'atomic_rollback': False
+        }
+    logger.info("✓ Data validation passed")
+    
+    # Truncate existing table before loading
+    if self.truncate_before_load:
+        try:
+            self._truncate_before_load()
+        except Exception as e:
+            logger.error(f"Failed to truncate table: {str(e)}")
+            return {
+                'success': False,
+                'error': f'Table truncation failed: {str(e)}',
+                'total_rows': 0,
+                'failed_rows': 0,
+                'failed_chunks': [],
+                'atomic_rollback': False
+            }
+    
+    logger.info("="*70)
+    logger.info(f"LOAD MODE: {'ATOMIC (All-or-Nothing)' if self.atomic_load else 'BEST EFFORT'}")
+    logger.info("="*70)
+    
+    # Continue with rest of the method (chunk processing, etc.)
+    # ... rest remains the same ...
+```
+
+### Change 4: Remove `create_table_from_dataframe()` method
+
+**You can comment out or delete this entire method** (around line 280-330):
+```python
+# def create_table_from_dataframe(self, sample_df, drop_if_exists=True):
+#     """This method is no longer used - tables must exist beforehand"""
+#     pass
+```
+
+***
+
+## File 2: `enterprise_data_loader/main.py`
+
+### Change 1: Update loader initialization
+
+**Find this section (around line 120-140):**
+```python
+# Initialize loader
+loader = DataLoader(
+    pool=self.pool,
+    table_name=self.config.loader.staging_table,
+    chunk_size=self.config.loader.chunk_size,
+    max_workers=self.config.loader.max_workers,
+    batch_errors=self.config.loader.batch_errors,
+    atomic_load=True
+)
+
+# Load data
+stats = loader.load_from_generator(
+    data_generator=parser.parse(),
+    create_table=self.config.loader.create_table,
+    drop_if_exists=self.config.loader.drop_if_exists
+)
+```
+
+**Replace with:**
+```python
+# Initialize loader
+loader = DataLoader(
+    pool=self.pool,
+    table_name=self.config.loader.staging_table,
+    chunk_size=self.config.loader.chunk_size,
+    max_workers=self.config.loader.max_workers,
+    batch_errors=self.config.loader.batch_errors,
+    atomic_load=True,
+    truncate_before_load=True  # NEW: Always truncate before load
+)
+
+# Load data (no create_table or drop_if_exists parameters)
+stats = loader.load_from_generator(
+    data_generator=parser.parse()
+)
+```
+
+### Change 2: Update main() function
+
+**Find this section (around line 180-200):**
+```python
+def main():
+    """Main entry point"""
+    config = AppConfig.from_env()
+    
+    # Database settings
+    config.database.user = 'your_username'
+    config.database.password = 'your_password'
+    config.database.dsn = 'localhost:1521/XEPDB1'
+    
+    # File settings
+    config.file.input_file = 'data.csv'
+    config.file.file_encoding = 'utf-8'
+    config.file.csv_delimiter = ','
+    
+    # Loader settings
+    config.loader.staging_table = 'STG_DATA_LOAD'
+    config.loader.chunk_size = 10000
+    config.loader.max_workers = 4
+    config.loader.batch_errors = True
+    config.loader.create_table = True      # <-- Remove this line
+    config.loader.drop_if_exists = True    # <-- Remove this line
+```
+
+**Replace with:**
+```python
+def main():
+    """Main entry point"""
+    config = AppConfig.from_env()
+    
+    # Database settings
+    config.database.user = 'your_username'
+    config.database.password = 'your_password'
+    config.database.dsn = 'localhost:1521/XEPDB1'
+    
+    # File settings
+    config.file.input_file = 'data.csv'
+    config.file.file_encoding = 'utf-8'
+    config.file.csv_delimiter = ','
+    
+    # Loader settings
+    config.loader.staging_table = 'STG_DATA_LOAD'  # Table must already exist!
+    config.loader.chunk_size = 10000
+    config.loader.max_workers = 4
+    config.loader.batch_errors = True
+    # No create_table or drop_if_exists - table must exist beforehand
+```
+
+***
+
+## File 3: `enterprise_data_loader/config.py` (Optional)
+
+**If you want to update defaults, find:**
+```python
+@dataclass
+class LoaderConfig:
+    """Loader configuration"""
+    staging_table: str = 'STG_DATA_LOAD'
+    chunk_size: int = 10000
+    max_workers: int = 4
+    batch_errors: bool = False
+    create_table: bool = True
+    drop_if_exists: bool = True
+```
+
+**Replace with:**
+```python
+@dataclass
+class LoaderConfig:
+    """Loader configuration"""
+    staging_table: str = 'STG_DATA_LOAD'
+    chunk_size: int = 10000
+    max_workers: int = 4
+    batch_errors: bool = False
+    # Removed: create_table and drop_if_exists
+    # Tables must exist beforehand - will be truncated before load
+```
+
+***
+
+## Summary of Changes
+
+### What Changed:
+1. ✅ Added `truncate_before_load=True` parameter to DataLoader
+2. ✅ Added `_truncate_before_load()` method
+3. ✅ Modified `load_from_generator()` to truncate instead of create
+4. ✅ Removed create/drop parameters
+5. ✅ Simplified main() - no create_table or drop_if_exists
+
+### What Stays the Same:
+- ✅ No command-line arguments (hardcoded config)
+- ✅ Atomic load behavior (all-or-nothing)
+- ✅ Sequential chunk processing
+- ✅ Batch error handling
+- ✅ Detailed logging
+- ✅ Connection pooling
+
+### New Behavior:
+```python
+# Old: python main.py
+# → DROP TABLE (if exists)
+# → CREATE TABLE from file schema
+# → Load data
+
+# New: python main.py
+# → Table must already exist
+# → TRUNCATE TABLE
+# → Load data
+# → On failure: TRUNCATE again (atomic rollback)
+```
+
+### Usage Example:
+
+**Step 1: Create table manually (one time):**
+```sql
+CREATE TABLE STG_DATA_LOAD (
+    ID NUMBER,
+    NAME VARCHAR2(100),
+    AGE NUMBER,
+    SALARY NUMBER
+);
+```
+
+**Step 2: Run loader (truncates automatically):**
+```python
+python main.py
+```
+
+**What happens:**
+1. Validates file
+2. Truncates `STG_DATA_LOAD` (empties it)
+3. Loads data in chunks
+4. If any chunk fails → Truncates again (atomic rollback)
+
+This gives you the **simple original version** with **truncate instead of create/drop** [1]!
+
+Citations:
+[1] 1000143971.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/5992b391-f10b-45d0-81e4-fd50e4c4edbf/1000143971.jpg?AWSAccessKeyId=ASIA2F3EMEYE5JTALO5Q&Signature=fgfrp6BYCUAxuKo8dxvZ3Hel0KI%3D&x-amz-security-token=IQoJb3JpZ2luX2VjEMX%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEaCXVzLWVhc3QtMSJGMEQCIAagkoO6D7NNr1HHC%2BCAx9QIXfVUFYHMc68dwSlEtPhoAiBBniTEvBuNdm7JjaFhCpcDXtgS7%2Br%2F%2Bz1eCroLiFWxkir8BAiN%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F8BEAEaDDY5OTc1MzMwOTcwNSIMTFdzg0e614C%2FN8VoKtAE2V68kYO6c1F%2F0GD0GzpAecrmLqlnc4j6KlkohVRH29YMWEZu4vRJ9pztmZXC1sGw5ptWIRh9TWh2rwNpT1HflNzmYogrbTVtu0Ak5c46OBTfLphpmhbH1eJ0edtyhfjrb2xEoISSSgansR4bXBtcprFgz8SmlH765fwF79VbzaOyAfy%2FZYYpQE9ztXDbIdDy4rwZPKgHFW7IRzYMQgztGYucuwq8HbS%2FsC0z5gUj09iAWu1SPuroheLwUn2QLGgHXpQ%2BkztIbDN88xO4yy7ki7WAeALgZxBip32W3Qg0keceEwvSzI2HklTTEqdJiJQqHcKPGzpGzSpL9fQVfT8cMA0V2xIQYF8AWwo9BGsMUR0QJ4T14x0%2BvAuxFqVWxniJO9vYrDYY3I6X1I4lH4yUED4bvpfVfY52RsGfhekaEEXCuuxelmZNYhRudiE9Afmw53ZSuBDXM%2BZ6OAZ%2BeFb09z6vr87uggjVOtZ3i9RLKwf47HZkbFgcR4fY7lE3MDJouBAtZ9ZMnEQ3n3pfaGH%2FFJrWvSElDXJQ4Y%2FhsZDQKhFf11CCQiCPEATmd4ABPDA8PhEm8%2Ftu8CxkWGVkQvurSUcYJxf%2BHlNKlrS28LlGa%2FFEUHDnlQbF8rBAy%2FRai08tyQPjv1c%2Buyq1vJVOliPiPIXKmesg%2FN4rnemZrKRDqNB5BQl%2FW5eksfhDAqohMC2KCXdq75xz7fPswC%2BtXF2V%2Fcui1UivAZ%2BbocGVIOgKLH7rgbbdCf%2BmGTfpVVGWFEWGSou1cRSzu9B0VnOdPN4QLzD0%2BqzIBjqZAYGQIQqh2AH5o%2FhIy3lXSZOex5ViYrPrWZ4aIXu9R%2BzFyHRtNz86xXM%2ByNqiguM%2BzV9U0VqKbyb8A7rJri5EXaax%2Bi6fUaLIrwJSs4W391L8CFs5Zi5eXGZRCmgo5T7Ki2Y5oC%2FzkI3rC8CKeIpQYsATrwgLyg%2Fz4EHGp%2B7nDIhAt67F8PtDBaxcRxP4CYvEC%2BZ3h1awhPFj2g%3D%3D&Expires=1764936689
