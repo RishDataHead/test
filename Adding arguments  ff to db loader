@@ -1,0 +1,426 @@
+there should not be else case, the script can only be called if these two parameters are called.
+
+Perfect! You want the script to **require** the two parameters (filename and table_name) - no else case. Here's the simplified version [1]:
+
+***
+
+## File: `enterprise_data_loader/ff_dbloader.py`
+
+### Replace the `main()` function with this simplified version:
+
+```python
+def main():
+    """Main entry point - requires filename and table_name arguments"""
+    
+    # Check if required arguments provided
+    if len(sys.argv) < 3:
+        print("\nERROR: Missing required arguments!")
+        print("\nUsage:")
+        print("  python ff_dbloader.py <filename> <table_name>")
+        print("\nExample:")
+        print("  python ff_dbloader.py data.csv STG_EMPLOYEES")
+        print("\nOptional environment variables:")
+        print("  ORACLE_USER     - Oracle username (required)")
+        print("  ORACLE_PASSWORD - Oracle password (required)")
+        print("  ORACLE_DSN      - Oracle DSN (default: localhost:1521/XEPDB1)")
+        print()
+        sys.exit(1)
+    
+    # Get required arguments
+    filename = sys.argv[1]
+    table_name = sys.argv[2]
+    
+    logger.info(f"Called with arguments: filename={filename}, table={table_name}")
+    
+    # Call load_data function
+    result = load_data(filename, table_name)
+    
+    # Print final summary
+    print("\n" + "="*70)
+    print("FINAL EXECUTION SUMMARY")
+    print("="*70)
+    print(f"Status: {result.get('status')}")
+    print(f"Source File: {result.get('source_file')}")
+    print(f"Table Name: {result.get('table_name')}")
+    print(f"Row Count: {result.get('row_count', 0):,}")
+    print(f"Job Log: {result.get('job_log')}")
+    print("="*70)
+    
+    # Exit with appropriate code
+    success = result.get('success', False)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+***
+
+## Complete Simplified `ff_dbloader.py`
+
+Here's the complete file with only the essential parts:
+
+```python
+"""
+FF Database Loader - Must be called with filename and table_name
+"""
+
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Any
+from datetime import datetime
+
+from config import AppConfig
+from database.connection_pool import OracleConnectionPool
+from parsers.csv_parser import CSVParser
+from parsers.xml_parser import XMLParser
+from loaders.data_loader import DataLoader
+from utils.logger import LoggerFactory
+
+
+# Setup logging
+LoggerFactory.setup_logging()
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataLoaderApp:
+    """Main application orchestrator"""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.pool = None
+    
+    def _initialize_connection_pool(self):
+        """Initialize database connection pool"""
+        logger.info("Initializing database connection pool")
+        
+        self.pool = OracleConnectionPool(
+            user=self.config.database.user,
+            password=self.config.database.password,
+            dsn=self.config.database.dsn,
+            min_conn=self.config.database.min_pool_conn,
+            max_conn=self.config.database.max_pool_conn
+        )
+    
+    def _get_parser(self):
+        """Get appropriate parser based on file type"""
+        file_path = self.config.file.input_file
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.csv':
+            return CSVParser(
+                file_path=file_path,
+                chunk_size=self.config.loader.chunk_size,
+                encoding=self.config.file.file_encoding,
+                delimiter=self.config.file.csv_delimiter
+            )
+        elif file_ext == '.xml':
+            return XMLParser(
+                file_path=file_path,
+                record_tag=self.config.file.xml_record_tag,
+                chunk_size=self.config.loader.chunk_size,
+                schema_file=self.config.file.xml_schema_file
+            )
+        else:
+            raise ValueError(f"Unsupported file type: {file_ext}")
+    
+    def _print_statistics(self, stats: Dict[str, Any]):
+        """Print loading statistics"""
+        print("\n" + "="*70)
+        print(" "*25 + "LOAD STATISTICS")
+        print("="*70)
+        print(f"{'Load Mode:':<30} {'ATOMIC (All-or-Nothing)':>40}")
+        print(f"{'Total Rows Loaded:':<30} {stats.get('row_count', 0):>40,}")
+        print(f"{'Failed Rows:':<30} {stats.get('failed_rows', 0):>40,}")
+        print(f"{'Total Processed:':<30} {stats.get('total_rows_processed', 0):>40,}")
+        print(f"{'Total Chunks:':<30} {stats.get('total_chunks', 0):>40}")
+        print(f"{'Elapsed Time:':<30} {stats.get('elapsed_seconds', 0):>37.2f} sec")
+        print(f"{'Throughput:':<30} {stats.get('rows_per_second', 0):>35,.0f} rows/sec")
+        
+        status = 'SUCCESS' if stats.get('success', False) else 'FAILURE'
+        print(f"{'Status:':<30} {status:>40}")
+        print("="*70 + "\n")
+    
+    def run(self) -> dict:
+        """Execute data loading process"""
+        execution_start = datetime.now()
+        
+        try:
+            logger.info("Starting FF Database Loader")
+            logger.info(f"Input file: {self.config.file.input_file}")
+            logger.info(f"Target table: {self.config.loader.staging_table}")
+            
+            # Validate file exists
+            if not Path(self.config.file.input_file).exists():
+                logger.error(f"File not found: {self.config.file.input_file}")
+                return {
+                    'status': 'FAILURE',
+                    'script_name': 'ff_dbloader',
+                    'execution_start_dt': execution_start.isoformat(),
+                    'execution_end_dt': datetime.now().isoformat(),
+                    'source_file': self.config.file.input_file,
+                    'table_name': self.config.loader.staging_table,
+                    'row_count': 0,
+                    'job_log': f"ERROR: File not found - {self.config.file.input_file}",
+                    'success': False
+                }
+            
+            # Initialize connection pool
+            self._initialize_connection_pool()
+            
+            # Get parser
+            parser = self._get_parser()
+            
+            # Validate file
+            if not parser.validate():
+                logger.error("File validation failed")
+                return {
+                    'status': 'FAILURE',
+                    'script_name': 'ff_dbloader',
+                    'execution_start_dt': execution_start.isoformat(),
+                    'execution_end_dt': datetime.now().isoformat(),
+                    'source_file': self.config.file.input_file,
+                    'table_name': self.config.loader.staging_table,
+                    'row_count': 0,
+                    'job_log': 'ERROR: File validation failed',
+                    'success': False
+                }
+            
+            # Initialize loader
+            loader = DataLoader(
+                pool=self.pool,
+                table_name=self.config.loader.staging_table,
+                chunk_size=self.config.loader.chunk_size,
+                max_workers=self.config.loader.max_workers,
+                batch_errors=self.config.loader.batch_errors,
+                atomic_load=True,
+                truncate_before_load=True
+            )
+            
+            # Load data
+            stats = loader.load_from_generator(
+                data_generator=parser.parse()
+            )
+            
+            # Add source file information
+            stats['source_file'] = os.path.basename(self.config.file.input_file)
+            stats['source_file_path'] = os.path.abspath(self.config.file.input_file)
+            
+            # Print results
+            self._print_statistics(stats)
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Application failed: {str(e)}", exc_info=True)
+            
+            return {
+                'status': 'FAILURE',
+                'script_name': 'ff_dbloader',
+                'execution_start_dt': execution_start.isoformat(),
+                'execution_end_dt': datetime.now().isoformat(),
+                'source_file': os.path.basename(self.config.file.input_file) if self.config.file.input_file else 'Unknown',
+                'table_name': self.config.loader.staging_table,
+                'row_count': 0,
+                'job_log': f"EXCEPTION: {str(e)}",
+                'success': False,
+                'error': str(e)
+            }
+        
+        finally:
+            if self.pool:
+                self.pool.close()
+            logger.info("FF Database Loader finished")
+
+
+def load_data(filename: str, table_name: str, **kwargs) -> dict:
+    """
+    Main function to load data from file to Oracle table
+    
+    Args:
+        filename: Path to input file (CSV or XML)
+        table_name: Target Oracle table name
+        **kwargs: Optional parameters:
+            - user: Oracle username (default: from ORACLE_USER env)
+            - password: Oracle password (default: from ORACLE_PASSWORD env)
+            - dsn: Oracle DSN (default: from ORACLE_DSN env)
+            - delimiter: CSV delimiter (default: ',')
+            - encoding: File encoding (default: 'utf-8')
+            - chunk_size: Rows per chunk (default: 10000)
+            - batch_errors: Continue on row errors (default: False)
+    
+    Returns:
+        Dictionary with execution summary
+    """
+    # Create configuration
+    config = AppConfig.from_env()
+    
+    # Database settings (from kwargs or environment variables)
+    config.database.user = kwargs.get('user', os.getenv('ORACLE_USER'))
+    config.database.password = kwargs.get('password', os.getenv('ORACLE_PASSWORD'))
+    config.database.dsn = kwargs.get('dsn', os.getenv('ORACLE_DSN', 'localhost:1521/XEPDB1'))
+    
+    # Validate required credentials
+    if not config.database.user or not config.database.password:
+        raise ValueError(
+            "Database credentials not provided. "
+            "Set ORACLE_USER and ORACLE_PASSWORD environment variables "
+            "or pass user and password parameters."
+        )
+    
+    # File settings
+    config.file.input_file = filename
+    config.file.file_encoding = kwargs.get('encoding', 'utf-8')
+    config.file.csv_delimiter = kwargs.get('delimiter', ',')
+    
+    # Loader settings
+    config.loader.staging_table = table_name
+    config.loader.chunk_size = kwargs.get('chunk_size', 10000)
+    config.loader.batch_errors = kwargs.get('batch_errors', False)
+    
+    # Create and run application
+    app = DataLoaderApp(config)
+    execution_summary = app.run()
+    
+    return execution_summary
+
+
+def main():
+    """Main entry point - requires filename and table_name arguments"""
+    
+    # Check if required arguments provided
+    if len(sys.argv) < 3:
+        print("\nERROR: Missing required arguments!")
+        print("\nUsage:")
+        print("  python ff_dbloader.py <filename> <table_name>")
+        print("\nExample:")
+        print("  python ff_dbloader.py data.csv STG_EMPLOYEES")
+        print("\nRequired environment variables:")
+        print("  ORACLE_USER     - Oracle username")
+        print("  ORACLE_PASSWORD - Oracle password")
+        print("\nOptional environment variables:")
+        print("  ORACLE_DSN      - Oracle DSN (default: localhost:1521/XEPDB1)")
+        print()
+        sys.exit(1)
+    
+    # Get required arguments
+    filename = sys.argv[1]
+    table_name = sys.argv[2]
+    
+    logger.info(f"Called with arguments: filename={filename}, table={table_name}")
+    
+    # Call load_data function
+    result = load_data(filename, table_name)
+    
+    # Print final summary
+    print("\n" + "="*70)
+    print("FINAL EXECUTION SUMMARY")
+    print("="*70)
+    print(f"Status: {result.get('status')}")
+    print(f"Source File: {result.get('source_file')}")
+    print(f"Table Name: {result.get('table_name')}")
+    print(f"Row Count: {result.get('row_count', 0):,}")
+    print(f"Job Log: {result.get('job_log')}")
+    print("="*70)
+    
+    # Exit with appropriate code
+    success = result.get('success', False)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+***
+
+## Usage
+
+### Command Line (ONLY way to run it):
+
+```bash
+# Set environment variables first
+export ORACLE_USER=scott
+export ORACLE_PASSWORD=tiger
+export ORACLE_DSN=localhost:1521/XEPDB1
+
+# Run with required parameters
+python ff_dbloader.py data.csv STG_EMPLOYEES
+```
+
+### If Missing Arguments:
+
+```bash
+$ python ff_dbloader.py
+
+ERROR: Missing required arguments!
+
+Usage:
+  python ff_dbloader.py <filename> <table_name>
+
+Example:
+  python ff_dbloader.py data.csv STG_EMPLOYEES
+
+Required environment variables:
+  ORACLE_USER     - Oracle username
+  ORACLE_PASSWORD - Oracle password
+
+Optional environment variables:
+  ORACLE_DSN      - Oracle DSN (default: localhost:1521/XEPDB1)
+```
+
+### From Another Python Script:
+
+```python
+# Method 1: Using load_data function
+from enterprise_data_loader.ff_dbloader import load_data
+import os
+
+# Set credentials
+os.environ['ORACLE_USER'] = 'scott'
+os.environ['ORACLE_PASSWORD'] = 'tiger'
+
+# Call with just filename and table
+result = load_data('data.csv', 'STG_EMPLOYEES')
+
+print(f"Status: {result['status']}")
+print(f"Rows: {result['row_count']}")
+```
+
+```python
+# Method 2: Using subprocess
+import subprocess
+import os
+
+# Set credentials
+os.environ['ORACLE_USER'] = 'scott'
+os.environ['ORACLE_PASSWORD'] = 'tiger'
+os.environ['ORACLE_DSN'] = 'localhost:1521/XEPDB1'
+
+# Call script
+result = subprocess.run(
+    ['python', 'ff_dbloader.py', 'data.csv', 'STG_EMPLOYEES'],
+    capture_output=True,
+    text=True
+)
+
+print(result.stdout)
+exit_code = result.returncode  # 0 = success, 1 = failure
+```
+
+***
+
+## Key Changes
+
+✅ **Removed else case** - script MUST have 2 arguments  
+✅ **Clear error message** if arguments missing  
+✅ **Exit code 1** if arguments not provided  
+✅ **Environment variables required** for credentials  
+✅ **Can still be imported** as module using `load_data()` function
+
+Now the script **only works** when called with filename and table_name parameters [1]!
+
+Citations:
+[1] selected_image_2464512276554246466.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/2324763a-bf1f-4bda-a0d9-0046f2f729f2/selected_image_2464512276554246466.jpg
