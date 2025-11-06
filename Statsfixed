@@ -1,0 +1,285 @@
+file has data, data is also inserted in data but stats are showing 0
+
+Ah! So **data is actually loaded into the database** but the **statistics show 0**. This means the `_process_result()` method is not being called or the statistics aren't being aggregated properly [1].
+
+## Root Cause
+
+The issue is in how chunk results are being processed in **sequential mode**. The `_process_result()` method might not be updating `self.total_rows` correctly.
+
+## Fix: Ensure Statistics are Updated
+
+Here's what needs to be fixed in `enterprise_data_loader/loaders/data_loader.py`:
+
+### Fix 1: Verify `_process_result()` is Being Called
+
+**Find the sequential processing section in `load_from_generator()` (around line 380-420):**
+
+```python
+if self.atomic_load:
+    logger.info("ATOMIC MODE: Processing chunks sequentially to detect failures early")
+    
+    # Process first chunk
+    result = self._load_chunk(first_chunk, chunk_id)
+    self._process_result(result)
+    chunk_id += 1
+    
+    if result.get('rows_failed', 0) > 0:
+        logger.error(f"First chunk failed - aborting load")
+    else:
+        # Process remaining chunks
+        for chunk in data_generator:
+            # Stop if previous chunk failed
+            if self.failure_event.is_set():
+                logger.warning(f"Stopping at chunk {chunk_id} due to previous failure")
+                break
+            
+            result = self._load_chunk(chunk, chunk_id)
+            self._process_result(result)
+            chunk_id += 1
+            
+            if result.get('rows_failed', 0) > 0:
+                logger.error(f"Chunk {chunk_id-1} failed - aborting load")
+                break
+```
+
+**Add debug logging to see if it's being called:**
+
+```python
+if self.atomic_load:
+    logger.info("ATOMIC MODE: Processing chunks sequentially to detect failures early")
+    
+    # Process first chunk
+    result = self._load_chunk(first_chunk, chunk_id)
+    logger.info(f"DEBUG: First chunk result: {result}")  # ADD THIS
+    self._process_result(result)
+    logger.info(f"DEBUG: After processing - total_rows={self.total_rows}, failed_rows={self.failed_rows}")  # ADD THIS
+    chunk_id += 1
+    
+    if result.get('rows_failed', 0) > 0:
+        logger.error(f"First chunk failed - aborting load")
+    else:
+        # Process remaining chunks
+        for chunk in data_generator:
+            if self.failure_event.is_set():
+                logger.warning(f"Stopping at chunk {chunk_id} due to previous failure")
+                break
+            
+            result = self._load_chunk(chunk, chunk_id)
+            logger.info(f"DEBUG: Chunk {chunk_id} result: {result}")  # ADD THIS
+            self._process_result(result)
+            logger.info(f"DEBUG: After chunk {chunk_id} - total_rows={self.total_rows}, failed_rows={self.failed_rows}")  # ADD THIS
+            chunk_id += 1
+            
+            if result.get('rows_failed', 0) > 0:
+                logger.error(f"Chunk {chunk_id-1} failed - aborting load")
+                break
+```
+
+### Fix 2: Check `_process_result()` Method
+
+**Make sure this method looks like this:**
+
+```python
+def _process_result(self, result: Dict[str, Any]):
+    """Process a chunk result and update statistics"""
+    logger.info(f"DEBUG: _process_result called with: {result}")  # ADD THIS
+    
+    with self.stats_lock:
+        if not result.get('skipped', False):
+            rows_inserted = result.get('rows_inserted', 0)
+            rows_failed = result.get('rows_failed', 0)
+            
+            logger.info(f"DEBUG: Adding {rows_inserted} to total_rows, {rows_failed} to failed_rows")  # ADD THIS
+            
+            self.total_rows += rows_inserted
+            self.failed_rows += rows_failed
+            
+            if rows_failed > 0:
+                failed_chunk_info = {
+                    'chunk_id': result['chunk_id'],
+                    'rows_failed': rows_failed,
+                    'total_rows': result['total_rows'],
+                    'error_message': result.get('error_message', 'Unknown error')
+                }
+                self.failed_chunks.append(failed_chunk_info)
+        else:
+            logger.warning(f"DEBUG: Chunk {result.get('chunk_id')} was skipped")  # ADD THIS
+    
+    logger.info(f"DEBUG: After update - total_rows={self.total_rows}, failed_rows={self.failed_rows}")  # ADD THIS
+```
+
+### Fix 3: Check the Final Statistics Calculation
+
+**At the end of `load_from_generator()`, verify the calculation:**
+
+```python
+# BEFORE returning stats, add debug logging
+logger.info("="*70)
+logger.info("DEBUG: FINAL STATISTICS CALCULATION")
+logger.info(f"self.total_rows = {self.total_rows}")
+logger.info(f"self.failed_rows = {self.failed_rows}")
+logger.info(f"rows_before_rollback = {rows_before_rollback if 'rows_before_rollback' in locals() else 'Not set'}")
+logger.info(f"atomic_rollback_performed = {atomic_rollback_performed if 'atomic_rollback_performed' in locals() else 'Not set'}")
+logger.info("="*70)
+
+# Build comprehensive execution summary
+from datetime import datetime
+
+result = {
+    # ... existing code ...
+    'row_count': self.total_rows,  # This should not be 0!
+    'total_rows_processed': rows_before_rollback + self.failed_rows,
+    # ... rest of result ...
+}
+```
+
+### Fix 4: Complete Corrected Section
+
+**Replace the entire statistics section at the end of `load_from_generator()`:**
+
+```python
+        overall_elapsed = time.time() - overall_start
+        
+        # Calculate rows before any potential rollback
+        rows_before_rollback = self.total_rows
+        
+        logger.info("="*70)
+        logger.info("ALL CHUNKS PROCESSED")
+        logger.info(f"Total rows successfully inserted: {self.total_rows:,}")
+        logger.info(f"Total rows failed: {self.failed_rows:,}")
+        logger.info(f"Total time: {overall_elapsed:.2f} seconds")
+        logger.info("="*70)
+        
+        # ATOMIC ROLLBACK: Truncate table if any failure occurred
+        atomic_rollback_performed = False
+        
+        if self.atomic_load and self.failed_rows > 0:
+            logger.error("="*70)
+            logger.error("ATOMIC LOAD FAILURE DETECTED")
+            logger.error("="*70)
+            logger.error(f"First failed chunk: {self.first_failure_info['chunk_id']}")
+            logger.error(f"Failure reason: {self.first_failure_info['error']}")
+            logger.error(f"Rows that were inserted: {rows_before_rollback:,}")
+            logger.error(f"Rows that failed: {self.failed_rows:,}")
+            logger.error("")
+            logger.error("Initiating atomic rollback...")
+            
+            self._truncate_table()
+            atomic_rollback_performed = True
+            
+            # IMPORTANT: Don't reset total_rows to 0 here for statistics
+            # We need to report what was processed
+            
+            logger.error("="*70)
+            logger.error("ATOMIC ROLLBACK COMPLETED")
+            logger.error("Final state: Table is EMPTY - NO DATA was loaded")
+            logger.error("="*70)
+        
+        # Build comprehensive execution summary
+        from datetime import datetime
+        
+        result = {
+            # Execution metadata
+            'status': 'COMPLETED' if self.failed_rows == 0 else 'FAILURE',
+            'script_name': 'ff_dbloader',
+            'execution_start_dt': datetime.fromtimestamp(overall_start).isoformat(),
+            'execution_end_dt': datetime.now().isoformat(),
+            'elapsed_seconds': overall_elapsed,
+            
+            # Data statistics
+            'row_count': 0 if atomic_rollback_performed else self.total_rows,  # FIXED: 0 if rolled back
+            'total_rows_processed': rows_before_rollback + self.failed_rows,    # FIXED: Total attempted
+            'failed_rows': self.failed_rows,
+            'total_chunks': chunk_id,
+            'rows_per_second': (rows_before_rollback + self.failed_rows) / overall_elapsed if overall_elapsed > 0 else 0,
+            
+            # Success/Failure details
+            'success': self.failed_rows == 0,
+            'atomic_rollback': atomic_rollback_performed,
+            'atomic_mode': self.atomic_load,
+            
+            # Error information
+            'job_log': None,
+            'failed_chunks': self.failed_chunks,
+            'failed_chunk_ids': [fc['chunk_id'] for fc in self.failed_chunks],
+            
+            # Additional metadata
+            'table_name': self.table_name,
+            'chunk_size': self.chunk_size,
+            'batch_errors_enabled': self.batch_errors
+        }
+        
+        # Add error log if failures occurred
+        if self.failed_rows > 0:
+            error_messages = []
+            
+            if self.first_failure_info:
+                error_messages.append(
+                    f"First failure at chunk {self.first_failure_info['chunk_id']}: "
+                    f"{self.first_failure_info['error']}"
+                )
+            
+            for fc in self.failed_chunks:
+                error_messages.append(
+                    f"Chunk {fc['chunk_id']}: {fc['rows_failed']} rows failed - {fc['error_message']}"
+                )
+            
+            result['job_log'] = '; '.join(error_messages)
+            
+            if atomic_rollback_performed:
+                result['rows_before_rollback'] = rows_before_rollback
+                result['first_failure'] = self.first_failure_info
+                result['job_log'] += f"; ATOMIC ROLLBACK: All {rows_before_rollback} rows removed from table"
+        else:
+            result['job_log'] = 'Success - No errors'
+        
+        # Log the final result for debugging
+        logger.info("="*70)
+        logger.info("EXECUTION SUMMARY")
+        logger.info("="*70)
+        logger.info(f"Status: {result['status']}")
+        logger.info(f"Row Count (in table): {result['row_count']}")
+        logger.info(f"Total Processed: {result['total_rows_processed']}")
+        logger.info(f"Failed Rows: {result['failed_rows']}")
+        logger.info(f"Job Log: {result['job_log']}")
+        logger.info("="*70)
+        
+        return result
+```
+
+## Key Changes Made
+
+1. **Track `rows_before_rollback`** before truncation
+2. **Don't reset `self.total_rows` to 0** - keep for reporting
+3. **Use different values**:
+   - `row_count`: Final rows in table (0 if rollback)
+   - `total_rows_processed`: Total rows attempted to insert
+4. **Added debug logging** to track statistics updates
+
+## Expected Output After Fix
+
+**With successful load:**
+```
+Total Rows Loaded:         10,000
+Total Processed:           10,000
+```
+
+**With failed load (atomic rollback):**
+```
+Total Rows Loaded:              0  (table truncated)
+Total Processed:           10,000  (attempted to process)
+```
+
+## Quick Verification
+
+**Check your database:**
+```sql
+SELECT COUNT(*) FROM STG_DATA_LOAD;
+```
+
+If this shows rows but stats show 0, then statistics aren't being updated in `_process_result()`.
+
+Run the code with the debug logging added, and you'll see exactly where the statistics are getting lost [1]!
+
+Citations:
+[1] selected_image_2464512276554246466.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/2324763a-bf1f-4bda-a0d9-0046f2f729f2/selected_image_2464512276554246466.jpg
