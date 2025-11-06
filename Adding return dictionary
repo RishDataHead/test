@@ -1,0 +1,494 @@
+the code should also return a list/dictionary at the end with values
+like status:Completed/Failure
+execution_start_dt
+execution_end_dt
+Script_name: ff_dbloader
+row_count:
+job_log : error log if any 
+source_file: file name
+
+Perfect! I'll add a comprehensive execution summary dictionary that gets returned. You need to modify **TWO FILES** [1]:
+
+***
+
+## File 1: `enterprise_data_loader/loaders/data_loader.py`
+
+### Modify `load_from_generator()` to include execution metadata
+
+**Find the return statement at the end of `load_from_generator()` (around line 450-470):**
+
+```python
+        result = {
+            'total_rows': self.total_rows,
+            'failed_rows': self.failed_rows,
+            'total_processed': rows_before_rollback + self.failed_rows,
+            'total_chunks': chunk_id,
+            'failed_chunks': self.failed_chunks,
+            'failed_chunk_ids': [fc['chunk_id'] for fc in self.failed_chunks],
+            'elapsed_seconds': overall_elapsed,
+            'rows_per_second': (rows_before_rollback + self.failed_rows) / overall_elapsed if overall_elapsed > 0 else 0,
+            'success': self.failed_rows == 0,
+            'summary_file': summary_file,
+            'atomic_rollback': atomic_rollback_performed,
+            'atomic_mode': self.atomic_load
+        }
+        
+        if atomic_rollback_performed:
+            result['rows_before_rollback'] = rows_before_rollback
+            result['first_failure'] = self.first_failure_info
+        
+        return result
+```
+
+**Replace with this enhanced version:**
+
+```python
+        # Build comprehensive execution summary
+        from datetime import datetime
+        
+        result = {
+            # Execution metadata
+            'status': 'COMPLETED' if self.failed_rows == 0 else 'FAILURE',
+            'script_name': 'ff_dbloader',
+            'execution_start_dt': datetime.fromtimestamp(overall_start).isoformat(),
+            'execution_end_dt': datetime.now().isoformat(),
+            'elapsed_seconds': overall_elapsed,
+            
+            # Data statistics
+            'row_count': self.total_rows,  # Final count in table
+            'total_rows_processed': rows_before_rollback + self.failed_rows,
+            'failed_rows': self.failed_rows,
+            'total_chunks': chunk_id,
+            'rows_per_second': (rows_before_rollback + self.failed_rows) / overall_elapsed if overall_elapsed > 0 else 0,
+            
+            # Success/Failure details
+            'success': self.failed_rows == 0,
+            'atomic_rollback': atomic_rollback_performed,
+            'atomic_mode': self.atomic_load,
+            
+            # Error information
+            'job_log': None,  # Will be populated if errors
+            'failed_chunks': self.failed_chunks,
+            'failed_chunk_ids': [fc['chunk_id'] for fc in self.failed_chunks],
+            
+            # Additional metadata
+            'table_name': self.table_name,
+            'chunk_size': self.chunk_size,
+            'batch_errors_enabled': self.batch_errors
+        }
+        
+        # Add error log if failures occurred
+        if self.failed_rows > 0:
+            error_messages = []
+            
+            # Add first failure info
+            if self.first_failure_info:
+                error_messages.append(
+                    f"First failure at chunk {self.first_failure_info['chunk_id']}: "
+                    f"{self.first_failure_info['error']}"
+                )
+            
+            # Add all failed chunk details
+            for fc in self.failed_chunks:
+                error_messages.append(
+                    f"Chunk {fc['chunk_id']}: {fc['rows_failed']} rows failed - {fc['error_message']}"
+                )
+            
+            result['job_log'] = '; '.join(error_messages)
+            
+            # Add rollback information
+            if atomic_rollback_performed:
+                result['rows_before_rollback'] = rows_before_rollback
+                result['first_failure'] = self.first_failure_info
+                result['job_log'] += f"; ATOMIC ROLLBACK: All {rows_before_rollback} rows removed from table"
+        else:
+            result['job_log'] = 'Success - No errors'
+        
+        logger.info("="*70)
+        logger.info("EXECUTION SUMMARY")
+        logger.info("="*70)
+        logger.info(f"Status: {result['status']}")
+        logger.info(f"Script: {result['script_name']}")
+        logger.info(f"Start Time: {result['execution_start_dt']}")
+        logger.info(f"End Time: {result['execution_end_dt']}")
+        logger.info(f"Duration: {result['elapsed_seconds']:.2f} seconds")
+        logger.info(f"Row Count: {result['row_count']:,}")
+        logger.info(f"Job Log: {result['job_log']}")
+        logger.info("="*70)
+        
+        return result
+```
+
+***
+
+## File 2: `enterprise_data_loader/main.py`
+
+### Modify to capture source file and enhance return
+
+**Find the `run()` method (around line 120-180):**
+
+```python
+    def run(self) -> bool:
+        """
+        Execute data loading process
+        
+        Returns:
+            True if successful
+        """
+        stats = None
+        
+        try:
+            logger.info("Starting Enterprise Data Loader")
+            logger.info(f"Input file: {self.config.file.input_file}")
+            
+            # ... rest of run() method ...
+            
+            # Load data
+            stats = loader.load_from_generator(
+                data_generator=parser.parse()
+            )
+            
+            # Print results
+            self._print_statistics(stats)
+            
+            return stats.get('success', False) if stats else False
+```
+
+**Replace with:**
+
+```python
+    def run(self) -> dict:
+        """
+        Execute data loading process
+        
+        Returns:
+            Dictionary with execution summary
+        """
+        from datetime import datetime
+        import os
+        
+        stats = None
+        execution_start = datetime.now()
+        
+        try:
+            logger.info("Starting Enterprise Data Loader")
+            logger.info(f"Input file: {self.config.file.input_file}")
+            
+            # Validate file exists
+            if not Path(self.config.file.input_file).exists():
+                logger.error(f"File not found: {self.config.file.input_file}")
+                return {
+                    'status': 'FAILURE',
+                    'script_name': 'ff_dbloader',
+                    'execution_start_dt': execution_start.isoformat(),
+                    'execution_end_dt': datetime.now().isoformat(),
+                    'source_file': self.config.file.input_file,
+                    'table_name': self.config.loader.staging_table,
+                    'row_count': 0,
+                    'job_log': f"ERROR: File not found - {self.config.file.input_file}",
+                    'success': False
+                }
+            
+            # Initialize connection pool
+            self._initialize_connection_pool()
+            
+            # Get parser
+            parser = self._get_parser()
+            
+            # Validate file
+            if self.config.file.validate_schema:
+                if not parser.validate():
+                    logger.error("File validation failed")
+                    return {
+                        'status': 'FAILURE',
+                        'script_name': 'ff_dbloader',
+                        'execution_start_dt': execution_start.isoformat(),
+                        'execution_end_dt': datetime.now().isoformat(),
+                        'source_file': self.config.file.input_file,
+                        'table_name': self.config.loader.staging_table,
+                        'row_count': 0,
+                        'job_log': 'ERROR: File validation failed',
+                        'success': False
+                    }
+            
+            # Initialize loader
+            loader = DataLoader(
+                pool=self.pool,
+                table_name=self.config.loader.staging_table,
+                chunk_size=self.config.loader.chunk_size,
+                max_workers=self.config.loader.max_workers,
+                batch_errors=self.config.loader.batch_errors,
+                atomic_load=True,
+                truncate_before_load=True
+            )
+            
+            # Load data
+            stats = loader.load_from_generator(
+                data_generator=parser.parse()
+            )
+            
+            # Add source file information
+            stats['source_file'] = os.path.basename(self.config.file.input_file)
+            stats['source_file_path'] = os.path.abspath(self.config.file.input_file)
+            
+            # Print results
+            self._print_statistics(stats)
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Application failed: {str(e)}", exc_info=True)
+            
+            return {
+                'status': 'FAILURE',
+                'script_name': 'ff_dbloader',
+                'execution_start_dt': execution_start.isoformat(),
+                'execution_end_dt': datetime.now().isoformat(),
+                'source_file': os.path.basename(self.config.file.input_file) if self.config.file.input_file else 'Unknown',
+                'table_name': self.config.loader.staging_table,
+                'row_count': 0,
+                'job_log': f"EXCEPTION: {str(e)}",
+                'success': False,
+                'error': str(e)
+            }
+        
+        finally:
+            if self.pool:
+                self.pool.close()
+            logger.info("Application finished")
+```
+
+### Update `main()` function to use the returned dictionary:
+
+**Find:**
+```python
+def main():
+    """Main entry point"""
+    config = AppConfig.from_env()
+    
+    # ... configuration ...
+    
+    # Create and run application
+    app = DataLoaderApp(config)
+    success = app.run()
+    
+    # Exit with appropriate code
+    sys.exit(0 if success else 1)
+```
+
+**Replace with:**
+```python
+def main():
+    """Main entry point"""
+    config = AppConfig.from_env()
+    
+    # Database settings
+    config.database.user = 'your_username'
+    config.database.password = 'your_password'
+    config.database.dsn = 'localhost:1521/XEPDB1'
+    
+    # File settings
+    config.file.input_file = 'data.csv'
+    config.file.file_encoding = 'utf-8'
+    config.file.csv_delimiter = ','
+    
+    # Loader settings
+    config.loader.staging_table = 'STG_DATA_LOAD'
+    config.loader.chunk_size = 10000
+    config.loader.max_workers = 4
+    config.loader.batch_errors = True
+    
+    # Create and run application
+    app = DataLoaderApp(config)
+    execution_summary = app.run()
+    
+    # Print execution summary
+    print("\n" + "="*70)
+    print("FINAL EXECUTION SUMMARY")
+    print("="*70)
+    print(f"Status: {execution_summary.get('status')}")
+    print(f"Script Name: {execution_summary.get('script_name')}")
+    print(f"Source File: {execution_summary.get('source_file')}")
+    print(f"Table Name: {execution_summary.get('table_name')}")
+    print(f"Row Count: {execution_summary.get('row_count', 0):,}")
+    print(f"Start Time: {execution_summary.get('execution_start_dt')}")
+    print(f"End Time: {execution_summary.get('execution_end_dt')}")
+    print(f"Duration: {execution_summary.get('elapsed_seconds', 0):.2f} seconds")
+    print(f"Job Log: {execution_summary.get('job_log')}")
+    print("="*70)
+    
+    # You can also save to JSON file
+    import json
+    with open('execution_summary.json', 'w') as f:
+        json.dump(execution_summary, f, indent=2)
+    print(f"\nExecution summary saved to: execution_summary.json")
+    
+    # Exit with appropriate code
+    success = execution_summary.get('success', False)
+    sys.exit(0 if success else 1)
+```
+
+***
+
+## Example Output Dictionary
+
+### Successful Execution:
+```python
+{
+    "status": "COMPLETED",
+    "script_name": "ff_dbloader",
+    "execution_start_dt": "2025-11-06T13:21:15.123456",
+    "execution_end_dt": "2025-11-06T13:21:20.654321",
+    "elapsed_seconds": 5.53,
+    
+    "source_file": "data.csv",
+    "source_file_path": "/path/to/data.csv",
+    "table_name": "STG_DATA_LOAD",
+    
+    "row_count": 50000,
+    "total_rows_processed": 50000,
+    "failed_rows": 0,
+    "total_chunks": 5,
+    "rows_per_second": 9040.51,
+    
+    "success": true,
+    "atomic_rollback": false,
+    "atomic_mode": true,
+    
+    "job_log": "Success - No errors",
+    "failed_chunks": [],
+    "failed_chunk_ids": [],
+    
+    "chunk_size": 10000,
+    "batch_errors_enabled": true
+}
+```
+
+### Failed Execution with Rollback:
+```python
+{
+    "status": "FAILURE",
+    "script_name": "ff_dbloader",
+    "execution_start_dt": "2025-11-06T13:25:10.123456",
+    "execution_end_dt": "2025-11-06T13:25:14.987654",
+    "elapsed_seconds": 4.86,
+    
+    "source_file": "data.csv",
+    "source_file_path": "/path/to/data.csv",
+    "table_name": "STG_DATA_LOAD",
+    
+    "row_count": 0,
+    "total_rows_processed": 50000,
+    "failed_rows": 10000,
+    "total_chunks": 5,
+    "rows_per_second": 10288.07,
+    
+    "success": false,
+    "atomic_rollback": true,
+    "atomic_mode": true,
+    
+    "job_log": "First failure at chunk 3: ORA-01722: invalid number; Chunk 3: 10000 rows failed - ORA-01722: invalid number; ATOMIC ROLLBACK: All 30000 rows removed from table",
+    
+    "failed_chunks": [
+        {
+            "chunk_id": 3,
+            "rows_failed": 10000,
+            "total_rows": 10000,
+            "error_message": "ORA-01722: invalid number"
+        }
+    ],
+    "failed_chunk_ids": [3],
+    
+    "rows_before_rollback": 30000,
+    "first_failure": {
+        "chunk_id": 3,
+        "error": "ORA-01722: invalid number",
+        "rows_failed": 10000,
+        "total_rows": 10000
+    },
+    
+    "chunk_size": 10000,
+    "batch_errors_enabled": false
+}
+```
+
+***
+
+## JSON Output File
+
+The execution summary will be saved to `execution_summary.json`:
+
+```json
+{
+  "status": "COMPLETED",
+  "script_name": "ff_dbloader",
+  "execution_start_dt": "2025-11-06T13:21:15.123456",
+  "execution_end_dt": "2025-11-06T13:21:20.654321",
+  "elapsed_seconds": 5.53,
+  "row_count": 50000,
+  "total_rows_processed": 50000,
+  "failed_rows": 0,
+  "total_chunks": 5,
+  "rows_per_second": 9040.51,
+  "success": true,
+  "atomic_rollback": false,
+  "atomic_mode": true,
+  "job_log": "Success - No errors",
+  "source_file": "data.csv",
+  "source_file_path": "/home/user/data.csv",
+  "table_name": "STG_DATA_LOAD",
+  "chunk_size": 10000,
+  "batch_errors_enabled": true,
+  "failed_chunks": [],
+  "failed_chunk_ids": []
+}
+```
+
+***
+
+## Using the Return Dictionary in Your Code
+
+```python
+# Run the loader
+execution_summary = app.run()
+
+# Access values
+if execution_summary['status'] == 'COMPLETED':
+    print(f"Successfully loaded {execution_summary['row_count']} rows")
+    print(f"from {execution_summary['source_file']}")
+    print(f"into {execution_summary['table_name']}")
+else:
+    print(f"Load failed: {execution_summary['job_log']}")
+
+# Send to monitoring system
+send_to_monitoring(execution_summary)
+
+# Log to database
+log_to_audit_table(execution_summary)
+
+# Send email notification
+if execution_summary['status'] == 'FAILURE':
+    send_alert_email(execution_summary)
+```
+
+***
+
+## Summary of New Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | string | "COMPLETED" or "FAILURE" |
+| `script_name` | string | Always "ff_dbloader" |
+| `execution_start_dt` | ISO datetime | When execution started |
+| `execution_end_dt` | ISO datetime | When execution ended |
+| `source_file` | string | Filename only |
+| `source_file_path` | string | Full file path |
+| `table_name` | string | Target Oracle table |
+| `row_count` | int | Final rows in table (0 if rollback) |
+| `job_log` | string | Success message or error details |
+| `elapsed_seconds` | float | Total execution time |
+
+All existing fields are preserved, plus these new tracking fields [1]!
+
+Citations:
+[1] 1000143971.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/5992b391-f10b-45d0-81e4-fd50e4c4edbf/1000143971.jpg
