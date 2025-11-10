@@ -1,0 +1,241 @@
+why do we need main function , if we are only calling load data function
+
+You're absolutely right! Since you're **only** calling the `load_data()` function from other Python scripts, you **don't need the `main()` function at all**. Here's the simplified version [1]:
+
+***
+
+## Complete `ff_dbloader.py` - WITHOUT main() Function
+
+```python
+"""
+FF Database Loader - Import and use load_data() function
+No command-line interface - Python function only
+"""
+
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any
+
+from config import AppConfig
+from database.connection_pool import OracleConnectionPool
+from parsers.csv_parser import CSVParser
+from parsers.xml_parser import XMLParser
+from loaders.data_loader import DataLoader
+from utils.logger import LoggerFactory
+
+
+# Setup logging
+LoggerFactory.setup_logging()
+logger = LoggerFactory.get_logger(__name__)
+
+
+class DataLoaderApp:
+    """Main application orchestrator"""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.pool = None
+    
+    def _initialize_connection_pool(self):
+        """Initialize database connection pool"""
+        logger.info("Initializing database connection pool")
+        self.pool = OracleConnectionPool(
+            user=self.config.database.user,
+            password=self.config.database.password,
+            dsn=self.config.database.dsn,
+            min_conn=self.config.database.min_pool_conn,
+            max_conn=self.config.database.max_pool_conn
+        )
+    
+    def _get_parser(self):
+        """Get appropriate parser based on file type"""
+        file_path = self.config.file.input_file
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.csv':
+            return CSVParser(
+                file_path=file_path,
+                chunk_size=self.config.loader.chunk_size,
+                encoding=self.config.file.file_encoding,
+                delimiter=self.config.file.csv_delimiter
+            )
+        elif file_ext == '.xml':
+            return XMLParser(
+                file_path=file_path,
+                record_tag=self.config.file.xml_record_tag,
+                chunk_size=self.config.loader.chunk_size,
+                schema_file=self.config.file.xml_schema_file
+            )
+        else:
+            raise ValueError(f"Unsupported file type: {file_ext}")
+    
+    def _print_statistics(self, stats: Dict[str, Any]):
+        """Print loading statistics"""
+        print("\n" + "="*70)
+        print(" "*25 + "LOAD STATISTICS")
+        print("="*70)
+        print(f"{'Total Rows Loaded:':<30} {stats.get('row_count', 0):>40,}")
+        print(f"{'Failed Rows:':<30} {stats.get('failed_rows', 0):>40,}")
+        print(f"{'Total Processed:':<30} {stats.get('total_rows_processed', 0):>40,}")
+        print(f"{'Elapsed Time:':<30} {stats.get('elapsed_seconds', 0):>37.2f} sec")
+        status = 'SUCCESS' if stats.get('success', False) else 'FAILURE'
+        print(f"{'Status:':<30} {status:>40}")
+        print("="*70 + "\n")
+    
+    def run(self) -> dict:
+        """Execute data loading process"""
+        execution_start = datetime.now()
+        
+        try:
+            logger.info("Starting FF Database Loader")
+            logger.info(f"Input file: {self.config.file.input_file}")
+            logger.info(f"Target table: {self.config.loader.staging_table}")
+            
+            if not Path(self.config.file.input_file).exists():
+                logger.error(f"File not found: {self.config.file.input_file}")
+                return {
+                    'status': 'FAILURE',
+                    'script_name': 'ff_dbloader',
+                    'execution_start_dt': execution_start.isoformat(),
+                    'execution_end_dt': datetime.now().isoformat(),
+                    'source_file': self.config.file.input_file,
+                    'table_name': self.config.loader.staging_table,
+                    'row_count': 0,
+                    'job_log': f"ERROR: File not found - {self.config.file.input_file}",
+                    'success': False
+                }
+            
+            self._initialize_connection_pool()
+            parser = self._get_parser()
+            
+            if not parser.validate():
+                logger.error("File validation failed")
+                return {
+                    'status': 'FAILURE',
+                    'script_name': 'ff_dbloader',
+                    'execution_start_dt': execution_start.isoformat(),
+                    'execution_end_dt': datetime.now().isoformat(),
+                    'source_file': self.config.file.input_file,
+                    'table_name': self.config.loader.staging_table,
+                    'row_count': 0,
+                    'job_log': 'ERROR: File validation failed',
+                    'success': False
+                }
+            
+            loader = DataLoader(
+                pool=self.pool,
+                table_name=self.config.loader.staging_table,
+                chunk_size=self.config.loader.chunk_size,
+                max_workers=self.config.loader.max_workers,
+                batch_errors=self.config.loader.batch_errors,
+                atomic_load=True,
+                truncate_before_load=True
+            )
+            
+            stats = loader.load_from_generator(data_generator=parser.parse())
+            stats['source_file'] = os.path.basename(self.config.file.input_file)
+            stats['source_file_path'] = os.path.abspath(self.config.file.input_file)
+            
+            self._print_statistics(stats)
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Application failed: {str(e)}", exc_info=True)
+            return {
+                'status': 'FAILURE',
+                'script_name': 'ff_dbloader',
+                'execution_start_dt': execution_start.isoformat(),
+                'execution_end_dt': datetime.now().isoformat(),
+                'source_file': os.path.basename(self.config.file.input_file) if self.config.file.input_file else 'Unknown',
+                'table_name': self.config.loader.staging_table,
+                'row_count': 0,
+                'job_log': f"EXCEPTION: {str(e)}",
+                'success': False,
+                'error': str(e)
+            }
+        finally:
+            if self.pool:
+                self.pool.close()
+            logger.info("FF Database Loader finished")
+
+
+def load_data(filename: str, 
+              table_name: str, 
+              delimiter: str = ',',
+              encoding: str = 'utf-8',
+              xml_record_tag: str = 'record',
+              xml_schema_file: str = None,
+              chunk_size: int = 10000,
+              batch_errors: bool = False,
+              user: str = None,
+              password: str = None,
+              dsn: str = None) -> dict:
+    """
+    Load CSV or XML file into Oracle table
+    
+    Args:
+        filename: File path
+        table_name: Oracle table name
+        delimiter: CSV delimiter (default: ',')
+        encoding: File encoding (default: 'utf-8')
+        xml_record_tag: XML record element (default: 'record')
+        xml_schema_file: XSD file path (optional)
+        chunk_size: Rows per batch (default: 10000)
+        batch_errors: Skip bad rows (default: False)
+        user: Oracle username (default: ORACLE_USER env var)
+        password: Oracle password (default: ORACLE_PASSWORD env var)
+        dsn: Oracle DSN (default: ORACLE_DSN env var)
+    
+    Returns:
+        dict: Execution summary
+    """
+    config = AppConfig()
+    
+    config.database.user = user or os.getenv('ORACLE_USER')
+    config.database.password = password or os.getenv('ORACLE_PASSWORD')
+    config.database.dsn = dsn or os.getenv('ORACLE_DSN', 'localhost:1521/XEPDB1')
+    config.database.min_pool_conn = 2
+    config.database.max_pool_conn = 10
+    
+    if not config.database.user or not config.database.password:
+        raise ValueError("Set ORACLE_USER and ORACLE_PASSWORD environment variables")
+    
+    config.file.input_file = filename
+    config.file.file_encoding = encoding
+    config.file.csv_delimiter = delimiter
+    config.file.xml_record_tag = xml_record_tag
+    config.file.xml_schema_file = xml_schema_file
+    config.file.validate_schema = xml_schema_file is not None
+    
+    config.loader.staging_table = table_name
+    config.loader.chunk_size = chunk_size
+    config.loader.max_workers = 4
+    config.loader.batch_errors = batch_errors
+    
+    app = DataLoaderApp(config)
+    return app.run()
+
+
+# No main() function - this module is meant to be imported only
+```
+
+***
+
+## Usage
+
+```python
+from ff_dbloader import load_data
+import os
+
+os.environ['ORACLE_USER'] = 'scott'
+os.environ['ORACLE_PASSWORD'] = 'tiger'
+
+result = load_data('employees.csv', 'STG_EMPLOYEES')
+print(f"Status: {result['status']}, Rows: {result['row_count']}")
+```
+
+That's it! Clean and simple - just the `load_data()` function, no `main()` needed [1]!
+
+Citations:
+[1] selected_image_2464512276554246466.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/2324763a-bf1f-4bda-a0d9-0046f2f729f2/selected_image_2464512276554246466.jpg
