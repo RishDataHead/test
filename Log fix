@@ -1,0 +1,305 @@
+when I am inporting this load flat file to db  function  into another file.
+the log file is created automatically without even calling the func.
+
+The issue is that **`LoggerFactory.setup_logging()`** is being called at **module import time** (when the module is loaded), not when you call the function. This happens at the top of your files [1].
+
+## Problem: Logger Setup Runs on Import
+
+**In `ff_dbloader.py` (and other files):**
+
+```python
+from utils.logger import LoggerFactory
+
+# THIS RUNS IMMEDIATELY WHEN YOU IMPORT THE MODULE
+LoggerFactory.setup_logging()  # ← Creates log file instantly!
+logger = LoggerFactory.get_logger(__name__)
+```
+
+When you do `from ff_dbloader import load_data`, the log file is created even before you call the function.
+
+***
+
+## Solution 1: Lazy Logger Initialization (Recommended)
+
+**Change in `ff_dbloader.py`:**
+
+**Find:**
+```python
+from utils.logger import LoggerFactory
+
+# Setup logging
+LoggerFactory.setup_logging()  # ← Remove this line
+logger = LoggerFactory.get_logger(__name__)
+```
+
+**Replace with:**
+```python
+from utils.logger import LoggerFactory
+
+# Don't setup logging at import time
+logger = None  # Will be initialized in load_data()
+```
+
+**Then in `load_data()` function, add this at the very beginning:**
+
+```python
+def load_data(filename: str, 
+              table_name: str,
+              db_env: str = None,
+              delimiter: str = ',',
+              encoding: str = 'utf-8',
+              xml_record_tag: str = 'record',
+              xml_schema_file: str = None,
+              chunk_size: int = None,
+              batch_errors: bool = None,
+              user: str = None,
+              password: str = None,
+              dsn: str = None) -> dict:
+    """Load data from CSV or XML file into Oracle table"""
+    
+    # Initialize logger on first call (not at import time)
+    global logger
+    if logger is None:
+        LoggerFactory.setup_logging()
+        logger = LoggerFactory.get_logger(__name__)
+    
+    # Rest of your function...
+    config = AppConfig.from_ini(db_env)
+    # ... etc
+```
+
+***
+
+## Solution 2: Pass Log File Path as Parameter
+
+**Update `load_data()` signature:**
+
+```python
+def load_data(filename: str, 
+              table_name: str,
+              log_file: str = None,  # NEW: optional log file path
+              db_env: str = None,
+              # ... rest of parameters
+              ) -> dict:
+    """
+    Load data from CSV or XML file into Oracle table
+    
+    Args:
+        log_file: Path to log file (default: auto-generated in ./logs/)
+        # ... other args
+    """
+    
+    # Setup logging with custom path
+    if log_file:
+        LoggerFactory.setup_logging(log_file=log_file)
+    else:
+        LoggerFactory.setup_logging()
+    
+    logger = LoggerFactory.get_logger(__name__)
+    
+    # Rest of function...
+```
+
+***
+
+## Solution 3: Conditional Logger Setup
+
+**In `ff_dbloader.py`, wrap the logger setup:**
+
+```python
+from utils.logger import LoggerFactory
+
+# Only setup logging if running as main module
+logger = None
+
+def _ensure_logger():
+    """Ensure logger is initialized"""
+    global logger
+    if logger is None:
+        LoggerFactory.setup_logging()
+        logger = LoggerFactory.get_logger(__name__)
+    return logger
+
+
+def load_data(filename: str, table_name: str, **kwargs) -> dict:
+    """Load data function"""
+    
+    # Initialize logger when function is called
+    _ensure_logger()
+    
+    # Rest of your code...
+```
+
+***
+
+## Solution 4: Disable Logging for Imports
+
+**Create a function to control logging:**
+
+```python
+from utils.logger import LoggerFactory
+
+# Module-level flag
+_logging_enabled = False
+logger = None
+
+
+def enable_logging():
+    """Enable logging (call this before using load_data)"""
+    global _logging_enabled, logger
+    if not _logging_enabled:
+        LoggerFactory.setup_logging()
+        logger = LoggerFactory.get_logger(__name__)
+        _logging_enabled = True
+
+
+def load_data(filename: str, table_name: str, **kwargs) -> dict:
+    """Load data function"""
+    
+    # Auto-enable logging on first call
+    enable_logging()
+    
+    # Rest of function...
+```
+
+**Usage:**
+```python
+from ff_dbloader import load_data, enable_logging
+
+# Optional: explicitly enable logging
+enable_logging()
+
+# Or just call load_data (logging auto-enables)
+result = load_data('file.csv', 'TABLE')
+```
+
+***
+
+## Complete Fix (Recommended Approach)
+
+**Replace the top of `ff_dbloader.py`:**
+
+```python
+"""
+FF Database Loader - Import and use load_data() function
+"""
+
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any
+
+from config import AppConfig
+from database.connection_pool import OracleConnectionPool
+from parsers.csv_parser import CSVParser
+from parsers.xml_parser import XMLParser
+from loaders.data_loader import DataLoader
+from utils.logger import LoggerFactory
+
+
+# Don't setup logging at import time - do it lazily
+_logger = None
+
+
+def _get_logger():
+    """Get or create logger instance"""
+    global _logger
+    if _logger is None:
+        LoggerFactory.setup_logging()
+        _logger = LoggerFactory.get_logger(__name__)
+    return _logger
+
+
+class DataLoaderApp:
+    """Main application orchestrator"""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.pool = None
+        self.logger = _get_logger()  # Use lazy logger
+    
+    # Rest of class...
+
+
+def load_data(filename: str, table_name: str, **kwargs) -> dict:
+    """Load data from CSV or XML file into Oracle table"""
+    
+    # Get logger (initializes on first call)
+    logger = _get_logger()
+    
+    # Load configuration from config.ini
+    config = AppConfig.from_ini(kwargs.get('db_env'))
+    
+    # Rest of your function...
+```
+
+**Key change:**
+- Removed: `LoggerFactory.setup_logging()` from module level
+- Added: `_get_logger()` function that initializes logging only when needed
+- Logger is created on **first function call**, not on **import**
+
+***
+
+## Same Fix for Other Files
+
+**Apply the same pattern to:**
+
+1. **`loaders/data_loader.py`**
+2. **`parsers/csv_parser.py`**
+3. **`parsers/xml_parser.py`**
+4. **`database/connection_pool.py`**
+
+**Pattern:**
+```python
+# Top of file - OLD
+from utils.logger import LoggerFactory
+LoggerFactory.setup_logging()  # ← REMOVE
+logger = LoggerFactory.get_logger(__name__)
+
+# Top of file - NEW
+from utils.logger import LoggerFactory
+_logger = None
+
+def _get_logger():
+    global _logger
+    if _logger is None:
+        LoggerFactory.setup_logging()
+        _logger = LoggerFactory.get_logger(__name__)
+    return _logger
+
+# Then in your class/functions, use:
+logger = _get_logger()
+```
+
+***
+
+## Quick Test
+
+**Before fix:**
+```python
+# Just importing creates log file immediately
+from ff_dbloader import load_data  # ← Log file created here!
+# logs/data_loader_20251118_173245.log already exists
+```
+
+**After fix:**
+```python
+# Import doesn't create log file
+from ff_dbloader import load_data  # ← No log file yet
+
+# Log file only created when you call the function
+result = load_data('file.csv', 'TABLE')  # ← Log file created here
+```
+
+***
+
+## Summary
+
+**Problem:** `LoggerFactory.setup_logging()` at module level runs on import  
+**Solution:** Move logger initialization inside functions (lazy loading)  
+**Files to change:** `ff_dbloader.py` and any other files with module-level logger setup
+
+Now the log file will only be created when you actually call `load_data()`, not when you import it [1]!
+
+Citations:
+[1] selected_image_2464512276554246466.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/2324763a-bf1f-4bda-a0d9-0046f2f729f2/selected_image_2464512276554246466.jpg
