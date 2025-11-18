@@ -1,0 +1,128 @@
+once I am importing extract data to csv function,  the log file is auto created.
+i don't want to create it when being imported, i want to create it when it is called
+
+Perfect! The issue is that you're configuring logging at module import time. Here's the fix - **move logging configuration inside the function**:
+
+***
+
+## **Changes to make:**
+
+### **1. REMOVE the logging configuration from module level**
+
+**DELETE these lines from the top of your file:**
+```python
+# DELETE THIS:
+LOG_FILE = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+    force=True
+)
+```
+
+***
+
+### **2. ADD logging setup INSIDE the extract function**
+
+**At the very start of `extract_data_to_csv()` function, add:**
+
+```python
+def extract_data_to_csv(username, password, dsn, table_name, output_file=None, log_file=None):
+    """Extract data from Oracle Database to CSV file."""
+    
+    # Setup logging only when function is called
+    if log_file is None:
+        log_file = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    # Configure logging (only happens when function is called)
+    if not logging.getLogger().hasHandlers():
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+            force=True
+        )
+    
+    # Set default output file
+    if output_file is None:
+        output_file = 'oracle_table_data.csv'
+    
+    conn = None
+    cursor = None
+    start_time = time.time()
+    
+    # ... rest of function continues
+```
+
+***
+
+### **3. Keep your file structure clean**
+
+Your file should look like this:
+
+```python
+import oracledb
+import csv
+import logging
+from datetime import datetime
+from threading import Thread
+from queue import Queue
+import time
+
+# Configuration constants
+FETCH_BATCH_SIZE = 50000
+WRITE_BATCH_SIZE = 100000
+BUFFER_SIZE = 10 * 1024 * 1024
+
+# NO logging configuration here - module level is clean
+
+def csv_writer_process(write_queue, process_id, output_file):
+    """Dedicated writer thread"""
+    # Function code...
+    
+def extract_data_to_csv(username, password, dsn, table_name, output_file=None, log_file=None):
+    """Extract data from Oracle Database to CSV file."""
+    
+    # Logging is configured HERE when function is called
+    if log_file is None:
+        log_file = f'oracle_extract_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    if not logging.getLogger().hasHandlers():
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+            force=True
+        )
+    
+    # Rest of extraction logic...
+    
+if __name__ == '__main__':
+    # Test execution
+    result = extract_data_to_csv(...)
+```
+
+***
+
+Now when you import the module, **no log file is created** until you actually call the function:
+
+```python
+# In your main script
+from your_script import extract_data_to_csv  # No log file created here
+
+# Log file only created when you call the function
+result = extract_data_to_csv(
+    username='user',
+    password='pass',
+    dsn='host:1521/service',
+    table_name='my_table'
+)  # Log file created NOW
+```
+
+This is the proper lazy initialization pattern - resources are only created when actually needed[1][2].
+
+Citations:
+[1] selected_image_4695495282969847714.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/e6e369e6-8e33-4ec6-8311-3998c4ebe9de/selected_image_4695495282969847714.jpg
+[2] selected_image_7109357792060058343.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/92825140/71d529ae-727e-4e69-8d2d-842123a20f5f/selected_image_7109357792060058343.jpg
