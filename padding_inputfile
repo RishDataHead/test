@@ -1,0 +1,236 @@
+You only need to touch **two places**:
+
+1. **`DataLoader`** (to get column count from DB)
+2. **`CSVParser`** (to pad rows to that count)
+
+Below are **only the minimal changes** and exactly **which file and where**.
+
+***
+
+## 1) `loaders/data_loader.py` – add helper to get column count
+
+### a) Add method in `DataLoader` class
+
+In `enterprise_data_loader/loaders/data_loader.py`, **inside `class DataLoader`**, add this method (anywhere in the class, e.g. after `__init__`):
+
+```python
+def _get_table_column_count(self) -> int:
+    """
+    Get column count from Oracle table metadata
+    """
+    self.logger.info(f"Getting column count for table: {self.table_name}")
+    
+    try:
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM USER_TAB_COLUMNS
+                WHERE TABLE_NAME = :tname
+                """,
+                {'tname': self.table_name.upper()}
+            )
+            col_count = cursor.fetchone()[0]
+            cursor.close()
+        
+        self.logger.info(f"Table {self.table_name} has {col_count} columns")
+        return col_count
+    
+    except Exception as e:
+        self.logger.error(f"Failed to get column count for {self.table_name}: {e}")
+        raise
+```
+
+***
+
+## 2) `ff_dbloader.py` – pass DB column count into CSVParser
+
+### a) Modify `_get_parser` to call `_get_table_column_count`
+
+In `enterprise_data_loader/ff_dbloader.py`, inside `class DataLoaderApp`, **replace the `_get_parser` method** with this version:
+
+```python
+def _get_parser(self):
+    """
+    Get appropriate parser based on file type.
+    Uses column count from target DB table (not from file).
+    """
+    file_path = self.config.file.input_file
+    file_ext = Path(file_path).suffix.lower()
+    
+    # Get column count from target table via a temporary DataLoader
+    from .loaders.data_loader import DataLoader
+    temp_loader = DataLoader(
+        pool=self.pool,
+        table_name=self.config.loader.staging_table,
+        chunk_size=1000,
+        max_workers=1,
+        batch_errors=False,
+        atomic_load=False,
+        truncate_before_load=False
+    )
+    
+    try:
+        db_column_count = temp_loader._get_table_column_count()
+    except Exception as e:
+        self.logger.warning(f"Could not get DB column count, falling back to file: {e}")
+        db_column_count = None
+    
+    if file_ext == '.csv':
+        from .parsers.csv_parser import CSVParser
+        return CSVParser(
+            file_path=file_path,
+            chunk_size=self.config.loader.chunk_size,
+            encoding=self.config.file.file_encoding,
+            delimiter=self.config.file.csv_delimiter,
+            expected_columns=db_column_count  # NEW: use DB column count
+        )
+    elif file_ext == '.xml':
+        from .parsers.xml_parser import XMLParser
+        return XMLParser(
+            file_path=file_path,
+            record_tag=self.config.file.xml_record_tag,
+            chunk_size=self.config.loader.chunk_size,
+            schema_file=self.config.file.xml_schema_file
+        )
+    else:
+        raise ValueError(f"Unsupported file type: {file_ext}")
+```
+
+***
+
+## 3) `parsers/csv_parser.py` – pad each row to DB column count
+
+### a) Update CSVParser `__init__` to accept `expected_columns`
+
+In `enterprise_data_loader/parsers/csv_parser.py`, change the `__init__` signature:
+
+**Before:**
+```python
+def __init__(self, file_path, chunk_size, encoding='utf-8', delimiter=','):
+    self.logger = _get_logger()
+    self.file_path = file_path
+    self.chunk_size = chunk_size
+    self.encoding = encoding
+    self.delimiter = delimiter
+```
+
+**After:**
+```python
+def __init__(self, file_path, chunk_size, encoding='utf-8', delimiter=',',
+             expected_columns=None):
+    self.logger = _get_logger()
+    self.file_path = file_path
+    self.chunk_size = chunk_size
+    self.encoding = encoding
+    self.delimiter = delimiter
+    self.expected_columns = expected_columns  # NEW: column count from DB
+```
+
+### b) Change `parse()` to pad rows to `expected_columns`
+
+Replace the existing `parse()` in `csv_parser.py` with this version (using DB column count only, no file scan):
+
+```python
+def parse(self) -> Generator[pd.DataFrame, None, None]:
+    """
+    Parse CSV file in chunks.
+    Pads/truncates each row to match column count from DB table (expected_columns).
+    Missing values become None (inserted as NULL in DB).
+    """
+    self.logger.info(f"Parsing CSV file: {self.file_path}")
+    
+    if self.expected_columns is None:
+        self.logger.error("expected_columns is None - DB column count not provided")
+        raise ValueError("CSVParser.expected_columns must be set to DB column count")
+    
+    target_cols = self.expected_columns
+    self.logger.info(f"Using DB column count for padding: {target_cols}")
+    
+    chunk_count = 0
+    total_rows = 0
+    
+    try:
+        # Read header
+        with open(self.file_path, 'r', encoding=self.encoding) as f:
+            reader = csv.reader(f, delimiter=self.delimiter)
+            header = next(reader)
+        
+        file_col_count = len(header)
+        self.logger.info(f"File header has {file_col_count} columns")
+        
+        # Build column names: pad/truncate to target_cols
+        if file_col_count < target_cols:
+            column_names = header + [f'COL{i}' for i in range(file_col_count + 1, target_cols + 1)]
+            self.logger.info(f"Padded header from {file_col_count} to {target_cols} columns")
+        else:
+            column_names = header[:target_cols]
+            if file_col_count > target_cols:
+                self.logger.warning(f"Truncated header from {file_col_count} to {target_cols} columns")
+        
+        # Read data rows and pad/truncate each row
+        with open(self.file_path, 'r', encoding=self.encoding) as f:
+            reader = csv.reader(f, delimiter=self.delimiter)
+            next(reader)  # skip header
+            
+            buffer = []
+            
+            for row in reader:
+                if len(row) < target_cols:
+                    padded_row = row + [None] * (target_cols - len(row))
+                elif len(row) > target_cols:
+                    padded_row = row[:target_cols]
+                else:
+                    padded_row = row
+                
+                buffer.append(padded_row)
+                
+                if len(buffer) >= self.chunk_size:
+                    chunk_count += 1
+                    total_rows += len(buffer)
+                    
+                    df = pd.DataFrame(buffer, columns=column_names)
+                    self.logger.info(f"Chunk {chunk_count}: {len(df)} rows x {len(df.columns)} cols")
+                    
+                    yield df
+                    buffer = []
+            
+            # Remaining rows
+            if buffer:
+                chunk_count += 1
+                total_rows += len(buffer)
+                
+                df = pd.DataFrame(buffer, columns=column_names)
+                self.logger.info(f"Chunk {chunk_count}: {len(df)} rows x {len(df.columns)} cols (final)")
+                
+                yield df
+        
+        self.logger.info(f"CSV parsing complete - Total: {total_rows} rows in {chunk_count} chunks")
+    
+    except Exception as e:
+        self.logger.error(f"CSV parsing error: {e}")
+        raise
+```
+
+***
+
+## Recap
+
+**Only DB column count, no file scan:**
+
+- **`loaders/data_loader.py`**
+  - Add: `_get_table_column_count(self)`
+
+- **`ff_dbloader.py`**
+  - Change: `DataLoaderApp._get_parser()` to call `_get_table_column_count()` and pass `expected_columns` into `CSVParser`
+
+- **`parsers/csv_parser.py`**
+  - Change: `__init__` to accept `expected_columns`
+  - Change: `parse()` to always pad/truncate rows to `expected_columns`, filling missing values with `None` (NULL in Oracle)
+
+With this, the loader:
+- Reads DB table structure once
+- Pads every input row to that column count
+- Inserts NULL for missing columns
+- Does **not** scan entire file to find max columns.
