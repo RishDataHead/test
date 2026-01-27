@@ -1,0 +1,168 @@
+Looking at your script that runs multiple Python processes in parallel using threads, here's what you should add to monitor RAM and storage usage:
+
+## Option 1: Monitor the Parent Process (Simpler)
+
+Add this at the beginning and end of your `main()` function:
+
+```python
+import psutil
+import os
+
+def main():
+    # Get the parent process
+    parent_process = psutil.Process(os.getpid())
+    
+    commands = [...]
+    
+    print(f"Starting {len(commands)} scripts in parallel...\n")
+    
+    # Initial memory reading
+    initial_mem = parent_process.memory_info().rss / (1024 ** 2)
+    print(f"Initial memory usage: {initial_mem:.2f} MB\n")
+    
+    start_time = time.time()
+    
+    threads = []
+    for i, cmd in enumerate(commands, 1):
+        thread = threading.Thread(target=run_command, args=(cmd, f"Script-{i}"))
+        threads.append(thread)
+        thread.start()
+    
+    for thread in threads:
+        thread.join()
+    
+    total_time = time.time() - start_time
+    
+    # Final memory reading
+    final_mem = parent_process.memory_info().rss / (1024 ** 2)
+    peak_mem = parent_process.memory_info().rss / (1024 ** 2)
+    
+    print(f"\n{'='*60}")
+    print(f"All scripts completed in {total_time} seconds")
+    print(f"Final memory usage: {final_mem:.2f} MB")
+    print(f"Memory increase: {final_mem - initial_mem:.2f} MB")
+    print(f"{'='*60}")
+```
+
+## Option 2: Monitor All Child Processes (More Accurate)
+
+This tracks all spawned child processes:
+
+```python
+import psutil
+import os
+
+def main():
+    parent_process = psutil.Process(os.getpid())
+    
+    commands = [...]
+    
+    print(f"Starting {len(commands)} scripts in parallel...\n")
+    start_time = time.time()
+    
+    threads = []
+    for i, cmd in enumerate(commands, 1):
+        thread = threading.Thread(target=run_command, args=(cmd, f"Script-{i}"))
+        threads.append(thread)
+        thread.start()
+    
+    # Monitor while threads are running
+    max_memory = 0
+    while any(t.is_alive() for t in threads):
+        try:
+            # Get memory of parent + all children
+            total_mem = parent_process.memory_info().rss
+            for child in parent_process.children(recursive=True):
+                total_mem += child.memory_info().rss
+            
+            total_mem_mb = total_mem / (1024 ** 2)
+            max_memory = max(max_memory, total_mem_mb)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        time.sleep(0.5)  # Check every 0.5 seconds
+    
+    for thread in threads:
+        thread.join()
+    
+    total_time = time.time() - start_time
+    
+    print(f"\n{'='*60}")
+    print(f"All scripts completed in {total_time} seconds")
+    print(f"Peak memory usage (all processes): {max_memory:.2f} MB")
+    print(f"{'='*60}")
+```
+
+## Option 3: Most Complete Solution with Disk I/O
+
+```python
+import psutil
+import os
+import time
+import threading
+
+def monitor_resources(parent_process, stop_event, stats):
+    """Background thread to monitor resources"""
+    max_memory = 0
+    disk_start = psutil.disk_io_counters()
+    
+    while not stop_event.is_set():
+        try:
+            total_mem = parent_process.memory_info().rss
+            for child in parent_process.children(recursive=True):
+                total_mem += child.memory_info().rss
+            
+            total_mem_mb = total_mem / (1024 ** 2)
+            max_memory = max(max_memory, total_mem_mb)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        time.sleep(0.5)
+    
+    disk_end = psutil.disk_io_counters()
+    stats['max_memory'] = max_memory
+    stats['disk_read'] = (disk_end.read_bytes - disk_start.read_bytes) / (1024 ** 2)
+    stats['disk_write'] = (disk_end.write_bytes - disk_start.write_bytes) / (1024 ** 2)
+
+def main():
+    parent_process = psutil.Process(os.getpid())
+    
+    commands = [...]
+    
+    print(f"Starting {len(commands)} scripts in parallel...\n")
+    
+    # Start resource monitoring
+    stop_monitoring = threading.Event()
+    stats = {}
+    monitor_thread = threading.Thread(
+        target=monitor_resources, 
+        args=(parent_process, stop_monitoring, stats)
+    )
+    monitor_thread.start()
+    
+    start_time = time.time()
+    
+    threads = []
+    for i, cmd in enumerate(commands, 1):
+        thread = threading.Thread(target=run_command, args=(cmd, f"Script-{i}"))
+        threads.append(thread)
+        thread.start()
+    
+    for thread in threads:
+        thread.join()
+    
+    # Stop monitoring
+    stop_monitoring.set()
+    monitor_thread.join()
+    
+    total_time = time.time() - start_time
+    
+    print(f"\n{'='*60}")
+    print(f"All scripts completed in {total_time:.2f} seconds")
+    print(f"Peak memory usage: {stats['max_memory']:.2f} MB")
+    print(f"Disk read: {stats['disk_read']:.2f} MB")
+    print(f"Disk write: {stats['disk_write']:.2f} MB")
+    print(f"{'='*60}")
+
+main()
+```
+
+**I recommend Option 3** as it gives you the most comprehensive monitoring including peak memory across all child processes and disk I/O statistics. Just add `import psutil` at the top of your file (you may need to `pip install psutil` first).
